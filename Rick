@@ -2468,6 +2468,7 @@ task.spawn(function()
     end
 end)
 --───────────── СТАРТ ─────────────
+
 task.spawn(function()
     local StarterGui = game:GetService("StarterGui")
     for _ = 1, 5 do
