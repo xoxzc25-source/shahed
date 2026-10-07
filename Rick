@@ -1,11 +1,10 @@
 --════════════════════════════════════════════════════════════════
---  ШАХЕД HUB • v6.3 • LocalScript • StarterPlayer → StarterPlayerScripts
---  v6.2 + :
---   • ФИКС: мышь больше не залипает в центре после выхода из полёта
---     (страховка на ~0.5с, не воюет с реальным шифт-локом)
---  Персонаж ВИДЕН и СТОИТ НА МЕСТЕ во время полёта
---  ШАХЕД: вращение винтов как в v5.2 • FPV: эффекты вращения
---  Мобильные: полный тач-контроль
+--  ШАХЕД HUB • v6.6 • LocalScript • StarterPlayer → StarterPlayerScripts
+--  v6.5 + :
+--   • УДАЛЕНЫ ВСЕ ЭФФЕКТЫ ЛОПАСТЕЙ FPV — ничего не засоряет
+--   • Уведомление при старте: ШАХЕД / Скрипт от RickPrimeScripts
+--  Консоль чистая • Персонаж ВИДЕН и СТОИТ • фикс залипания мыши
+--  ШАХЕД: вращение винтов v5.2 • Мобильные: полный тач-контроль
 --════════════════════════════════════════════════════════════════
 
 local Players           = game:GetService("Players")
@@ -32,12 +31,12 @@ local CONFIG = {
     HUB_K        = 0.45,
     HUB_Y        = 0.35,
     HUB_DK       = 0.9,
-    CAM_FPV_Y    = 2.2,  -- высота камеры FPV (3-е лицо)
-    CAM_FPV_D    = 5.5,  -- отступ камеры FPV назад
-    CAM_SH_Y     = 3,    -- высота камеры ШАХЕДА (3-е лицо)
-    CAM_SH_D     = 9,    -- отступ камеры ШАХЕДА назад
-    HIDE_CHAR    = false, -- true = прятать персонажа во время полёта
-    FREEZE_CHAR  = true,  -- персонаж стоит на месте (заякорен)
+    CAM_FPV_Y    = 2.2,
+    CAM_FPV_D    = 5.5,
+    CAM_SH_Y     = 3,
+    CAM_SH_D     = 9,
+    HIDE_CHAR    = false,
+    FREEZE_CHAR  = true,
 }
 
 local shahedIds = { 108963318339589, 120141614672192, 111443745475294 }
@@ -197,7 +196,6 @@ local function pickSound(key)
             return path
         end
     end
-    warn("[ШАХЕД HUB] звук '" .. key .. "': ни один ID не загрузился, играет встроенный")
     soundCache[key] = false
     return nil
 end
@@ -314,7 +312,6 @@ local function applyRotation(m, rot)
             end
         end
     end)
-    if not ok then warn("[ШАХЕД HUB] разворот модели не удался") end
 end
 
 local function finalizePivot(m)
@@ -395,7 +392,6 @@ local function getRawModel(tp)
         end
     end
     rawFailed[tp] = true
-    warn("[ШАХЕД HUB] ни одна модель " .. tp .. " не загрузилась — запасная")
     return nil
 end
 
@@ -501,11 +497,10 @@ local function makeDroneModel(tp)
     return m
 end
 
---═══ ВИНТЫ ШАХЕДА — v5.2 БЕЗ ИЗМЕНЕНИЙ ═══
+--═══ ВИНТЫ ШАХЕДА — v5.2 ═══
 local function collectPropLocals(m, isFpv, pivotCF)
     local locals = {}
 
-    -- 1) по имени
     for _, x in ipairs(m:GetDescendants()) do
         if x:IsA("BasePart") then
             local n = x.Name:lower()
@@ -521,7 +516,6 @@ local function collectPropLocals(m, isFpv, pivotCF)
     end
     if #locals > 0 then return locals end
 
-    -- 2) авто-поиск: плоские детали-лопасти выше центра, дальше 18% габарита
     local ok, bbCF, bbSize = pcall(function() return m:GetBoundingBox() end)
     if not ok or not bbCF then return locals end
     local c = bbCF.Position
@@ -570,192 +564,6 @@ local function collectPropLocals(m, isFpv, pivotCF)
         }
     end
     return locals
-end
-
---═══ ВИНТЫ FPV: ЭФФЕКТ ВРАЩЕНИЯ ═══
--- Настоящие лопасти НЕ КРУТЯТСЯ. Определяем только ЦЕНТРЫ втулок
--- (из реальных позиций лопастей) и радиус. Детали-эффекты создаём
--- сами и вращаем строго вокруг вертикали дрона.
-local function collectFpvHubs(m, pivotCF)
-    local found = {}
-
-    -- путь 1: по именам
-    for _, x in ipairs(m:GetDescendants()) do
-        if x:IsA("BasePart") then
-            local n = x.Name:lower()
-            if n:find("prop") or n:find("blade") or n:find("rotor")
-                or n:find("винт") or n:find("лопаст") or n:find("fan") then
-                found[#found + 1] = x
-            end
-        end
-    end
-
-    local okB, bbCF, bbSize = pcall(function() return m:GetBoundingBox() end)
-
-    -- путь 2: авто — плоские детали вдали от центра
-    if #found == 0 and okB and bbCF then
-        local c = bbCF.Position
-        local ext = math.max(bbSize.X, bbSize.Y, bbSize.Z)
-        local biggest, bigVol = nil, 0
-        for _, x in ipairs(m:GetDescendants()) do
-            if x:IsA("BasePart") and x.Transparency < 1 then
-                local v = x.Size.X * x.Size.Y * x.Size.Z
-                if v > bigVol then bigVol = v biggest = x end
-            end
-        end
-        local cands = {}
-        for _, x in ipairs(m:GetDescendants()) do
-            if x:IsA("BasePart") and x.Transparency < 1 and x ~= biggest then
-                local dims = { x.Size.X, x.Size.Y, x.Size.Z }
-                table.sort(dims)
-                local isFlat = dims[1] < dims[3] * 0.4
-                local flatDist = (Vector3.new(x.Position.X, 0, x.Position.Z)
-                    - Vector3.new(c.X, 0, c.Z)).Magnitude
-                if isFlat and flatDist > ext * 0.12 then
-                    cands[#cands + 1] = { p = x, d = flatDist }
-                end
-            end
-        end
-        table.sort(cands, function(a, b) return a.d > b.d end)
-        for i = 1, math.min(#cands, 4) do
-            found[#found + 1] = cands[i].p
-        end
-    end
-
-    -- путь 3: вообще ничего — 4 эффекта по углам корпуса
-    if #found == 0 then
-        if not okB or not bbCF then return {} end
-        local rel = pivotCF:ToObjectSpace(bbCF)
-        local c = rel.Position
-        local hx = math.max(bbSize.X, 0.5) / 2
-        local hz = math.max(bbSize.Z, 0.5) / 2
-        local hy = bbSize.Y / 2
-        local k = CONFIG.HUB_K
-        local R = math.max(k * math.min(hx, hz) * CONFIG.HUB_DK, 0.7)
-        local hubs = {}
-        for _, sx in ipairs({1, -1}) do
-            for _, sz in ipairs({1, -1}) do
-                hubs[#hubs + 1] = {
-                    hub = Vector3.new(c.X + hx * k * sx, c.Y + hy * CONFIG.HUB_Y, c.Z + hz * k * sz),
-                    R = R,
-                }
-            end
-        end
-        print("[ШАХЕД HUB] FPV: лопасти не найдены — эффекты по 4 углам: " .. #hubs)
-        return hubs
-    end
-
-    -- группировка лопастей по втулкам
-    local items = {}
-    for _, x in ipairs(found) do
-        items[#items + 1] = { p = x, cf = pivotCF:ToObjectSpace(x.CFrame) }
-    end
-    print("[ШАХЕД HUB] FPV: лопастей найдено: " .. #items)
-
-    local ext = okB and math.max(bbSize.X, bbSize.Y, bbSize.Z) or 10
-    local Rg = math.max(ext * 0.15, 0.8)
-
-    local function buildGroups(radius)
-        local gs = {}
-        for _, it in ipairs(items) do
-            local best, bestD = nil, math.huge
-            for _, g in ipairs(gs) do
-                local d = (g.hub - it.cf.Position).Magnitude
-                if d < bestD then bestD = d best = g end
-            end
-            if best and bestD <= radius then
-                best.parts[#best.parts + 1] = it
-            else
-                gs[#gs + 1] = { hub = it.cf.Position, parts = { it } }
-            end
-        end
-        return gs
-    end
-
-    local groups = buildGroups(Rg)
-    if #groups == 1 and #items >= 2 then
-        groups = buildGroups(Rg * 0.4)
-    end
-
-    local hubs = {}
-    for _, g in ipairs(groups) do
-        local sum = Vector3.zero
-        for _, it in ipairs(g.parts) do sum = sum + it.cf.Position end
-        local hub = sum / #g.parts
-        local maxR = 0.5
-        for _, it in ipairs(g.parts) do
-            local cf, s = it.cf, it.p.Size
-            for ox = -1, 1, 2 do
-                for oy = -1, 1, 2 do
-                    for oz = -1, 1, 2 do
-                        local c3 = (cf * CFrame.new(s.X * 0.5 * ox, s.Y * 0.5 * oy, s.Z * 0.5 * oz)).Position
-                        maxR = math.max(maxR, (c3 - hub).Magnitude)
-                    end
-                end
-            end
-        end
-        hubs[#hubs + 1] = { hub = hub, R = maxR }
-    end
-    print("[ШАХЕД HUB] FPV: втулок: " .. #hubs)
-    return hubs
-end
-
--- создаём детали-эффекты на втулках
-local function createFpvSpinFX(model, hubs)
-    local groups = {}
-
-    for _, h in ipairs(hubs) do
-        local R = h.R
-        local parts = {}
-
-        -- 3 полупрозрачные "лопасти размытия" (лежат горизонтально)
-        for i = 0, 2 do
-            local bar = Instance.new("Part")
-            bar.Anchored, bar.CanCollide, bar.CanQuery, bar.CanTouch = true, false, false, false
-            bar.CastShadow = false
-            bar.TopSurface, bar.BottomSurface = Enum.SurfaceType.Smooth, Enum.SurfaceType.Smooth
-            bar.Name = "PropFX"
-            bar.Size = Vector3.new(R * 0.85, 0.06, R * 0.28)
-            bar.Color = Color3.fromRGB(55, 55, 55)
-            bar.Transparency = 0.35
-            bar.Material = Enum.Material.SmoothPlastic
-            local cf = CFrame.Angles(0, i * (math.pi * 2 / 3), 0) * CFrame.new(R * 0.45, 0, 0)
-            bar.CFrame = CFrame.new(h.hub) * cf
-            bar.Parent = model
-            parts[#parts + 1] = { p = bar, cf = cf }
-        end
-
-        -- лёгкий диск-дымка
-        local disc = Instance.new("Part")
-        disc.Shape = Enum.PartType.Cylinder
-        disc.Anchored, disc.CanCollide, disc.CanQuery, disc.CanTouch = true, false, false, false
-        disc.CastShadow = false
-        disc.TopSurface, disc.BottomSurface = Enum.SurfaceType.Smooth, Enum.SurfaceType.Smooth
-        disc.Name = "PropFX"
-        disc.Size = Vector3.new(0.05, R * 1.9, R * 1.9)
-        disc.Color = Color3.fromRGB(210, 210, 210)
-        disc.Transparency = 0.78
-        disc.Material = Enum.Material.SmoothPlastic
-        local discCF = CFrame.Angles(0, 0, math.rad(90))
-        disc.CFrame = CFrame.new(h.hub) * discCF
-        disc.Parent = model
-        parts[#parts + 1] = { p = disc, cf = discCF }
-
-        groups[#groups + 1] = { hub = h.hub, parts = parts }
-    end
-
-    print("[ШАХЕД HUB] FPV: эффектов винтов создано: " .. #groups)
-    return groups
-end
-
--- вращение эффектов: строго вокруг вертикали дрона через центр втулки
-local function updateFpvFX(groups, pivot, angle)
-    for _, g in ipairs(groups) do
-        local base = pivot * CFrame.new(g.hub)
-        for _, mem in ipairs(g.parts) do
-            mem.p.CFrame = base * CFrame.Angles(0, angle, 0) * mem.cf
-        end
-    end
 end
 
 -- ЭФФЕКТЫ -----------------------------------------------------------
@@ -1007,7 +815,6 @@ local droneModel, dronePos, engineSound, engineBase
 local yaw, pitch, roll, vel, spin, firstPerson, flightStart
 local savedWS, savedJP
 local propLocals = {}
-local fpvFX = {}
 local droneParts, fpApplied = {}, false
 local toggleWindow
 local droneUI
@@ -1177,7 +984,6 @@ local function samplePath(path, t)
     return last.cf
 end
 
--- Человек на повторе: клон целого персонажа (одежда/лицо/цвет)
 local function buildPersonForReplay(targetChar, rootCF)
     if not targetChar then return nil end
     local ok, m = pcall(function()
@@ -1313,10 +1119,8 @@ local function showReplay(pos, target, dronePath, targetPath, impact)
     droneClone.Parent = world
 
     local isFpvReplay = (droneType == "fpv")
-    local replayFX, replayProps
-    if isFpvReplay then
-        replayFX = createFpvSpinFX(droneClone, collectFpvHubs(droneClone, dronePath[1].cf))
-    else
+    local replayProps
+    if not isFpvReplay then
         replayProps = collectPropLocals(droneClone, false, dronePath[1].cf)
     end
 
@@ -1356,7 +1160,6 @@ local function showReplay(pos, target, dronePath, targetPath, impact)
     local lineFill = mk("Frame", { Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = T.white, BorderSizePixel = 0 }, lineBack)
     corner(1, lineBack) corner(1, lineFill)
 
-    -- NO SIGNAL ВНУТРИ окна (полосы генерируются строго внутри границ)
     local repStatic = mk("CanvasGroup", {
         Size = UDim2.fromScale(1, 1), BackgroundColor3 = T.black,
         BorderSizePixel = 0, Visible = false, ZIndex = 20, ClipsDescendants = true,
@@ -1394,11 +1197,8 @@ local function showReplay(pos, target, dronePath, targetPath, impact)
                 local tcf = samplePath(targetPath, tt)
                 if tcf then charClone:PivotTo(tcf) end
             end
-            -- винты на повторе
             rsp = rsp + 0.9
-            if isFpvReplay then
-                updateFpvFX(replayFX, cf, rsp)
-            else
+            if not isFpvReplay then
                 for _, pr in ipairs(replayProps) do
                     if pr.p.Parent then
                         local sp
@@ -1434,7 +1234,6 @@ local function showReplay(pos, target, dronePath, targetPath, impact)
             end
             RunService.RenderStepped:Wait()
         end
-        -- помехи 1.0с и окно тает вместе с ними
         local st = os.clock()
         while os.clock() - st < 1.0 do
             for _, s in ipairs(repStrips) do
@@ -1485,21 +1284,18 @@ local function endFlight(explode)
     local hum = getHum()
     if hum then hum.WalkSpeed, hum.JumpPower = savedWS or 16, savedJP or 50 end
     pcall(function() controls:Enable() end)
-    -- снять якорь с персонажа
     local rr = getRoot()
     if rr then rr.Anchored = false end
     hideChar(false)
     local cam = workspace.CurrentCamera
     if cam then cam.CameraType = Enum.CameraType.Custom end
     UserInputService.MouseBehavior = Enum.MouseBehavior.Default
-    -- ФИКС: страховка от залипания мыши в центре после шифт-лока
     task.spawn(function()
         for _ = 1, 40 do
-            if flying then break end -- дрон снова запущен — не мешаем
+            if flying then break end
             if UserInputService.MouseBehavior == Enum.MouseBehavior.LockCenter then
                 UserInputService.MouseBehavior = Enum.MouseBehavior.Default
                 RunService.RenderStepped:Wait()
-                -- если залочился обратно — шифт-лок включён в настройках, не трогаем
                 if UserInputService.MouseBehavior == Enum.MouseBehavior.LockCenter then break end
             else
                 break
@@ -1690,7 +1486,6 @@ local function launchDrone()
     local okModel, model = pcall(makeDroneModel, droneType)
     if not okModel or not model or not anyPart(model) then
         setStatus("модель не загрузилась")
-        warn("[ШАХЕД HUB] модель дрона не построилась, запуск отменён")
         return
     end
 
@@ -1770,17 +1565,8 @@ local function launchDrone()
         cam0.CFrame = CFrame.lookAt(eye, eye + pivot0.LookVector)
     end
 
-    -- ШАХЕД: v5.2 логика • FPV: эффекты вращения (лопасти не трогаем)
     propLocals = {}
-    fpvFX = {}
-    if isFpv then
-        fpvFX = createFpvSpinFX(droneModel, collectFpvHubs(droneModel, pivot0))
-        for _, g in ipairs(fpvFX) do
-            for _, mem in ipairs(g.parts) do
-                droneParts[#droneParts + 1] = mem.p
-            end
-        end
-    else
+    if not isFpv then
         propLocals = collectPropLocals(droneModel, false, pivot0)
     end
 
@@ -1859,7 +1645,6 @@ local function launchDrone()
         end
         local tv = Vector3.zero
         if fwdAxis > 0 then tv = tv + lookV * ((boosting and boost or spd) * fwdAxis) end
-        -- НАЗАД = по обратному взгляду: камера вниз + S = назад-вверх
         if backSpd > 0 and backAxis > 0 then tv = tv - lookV * (backSpd * backAxis) end
         if strafe > 0 and strafeAxis ~= 0 then tv = tv + rightV * (strafe * strafeAxis) end
         if upAxis ~= 0 then tv = tv + Vector3.new(0, vert * upAxis, 0) end
@@ -1898,11 +1683,8 @@ local function launchDrone()
         local pivot = CFrame.new(dronePos) * CFrame.fromEulerAnglesYXZ(pitch, yaw, roll)
         droneModel:PivotTo(pivot)
 
-        -- винты: FPV — эффекты (лопасти статичны), ШАХЕД — v5.2
-        if isFpv then
-            spin = spin + dt * 22
-            updateFpvFX(fpvFX, pivot, spin)
-        else
+        -- винты: только ШАХЕД крутится (v5.2), FPV — лопасти не трогаются
+        if not isFpv then
             spin = spin + dt * 40
             for _, pr in ipairs(propLocals) do
                 if pr.p.Parent then
@@ -2420,7 +2202,6 @@ task.spawn(function()
     if bootError then
         status.Text = "ОШИБКА: " .. tostring(bootError):sub(1, 120)
         status.TextColor3 = Color3.fromRGB(255, 120, 120)
-        warn("[ШАХЕД HUB] " .. tostring(bootError))
         return
     end
 
@@ -2441,32 +2222,7 @@ task.spawn(function()
     task.wait(0.55)
     gui:Destroy()
 end)
-                      -- СИСТЕМНОЕ СООБЩЕНИЕ В ЧАТ (как при геймпассе) -----------------------
-task.spawn(function()
-    task.wait(6) -- через 6 секунд после загрузки
 
-    local msg = "Скрипт сделан TG: RickPrimeScripts"
-
-    -- новый чат (TextChatService)
-    local ok = pcall(function()
-        local tcs = game:GetService("TextChatService")
-        local general = tcs:FindFirstChild("TextChannels") and tcs.TextChannels:FindFirstChild("RBXGeneral")
-        if general then
-            general:DisplaySystemMessage("<font color=\"#AAAAAA\">" .. msg .. "</font>")
-        end
-    end)
-
-    -- старый чат (фолбэк)
-    if not ok then
-        pcall(function()
-            game:GetService("StarterGui"):SetCore("ChatMakeSystemMessage", {
-                Text = msg,
-                Color = Color3.fromRGB(170, 170, 170),
-                Font = Enum.Font.SourceSansBold,
-            })
-        end)
-    end
-end)
 --───────────── СТАРТ ─────────────
 
 task.spawn(function()
@@ -2482,20 +2238,4 @@ task.spawn(function()
         if ok then break end
         task.wait(1)
     end
-end)
-
-task.spawn(function()
-    showSplash()
-end)
-
-buildAndGive()
-
-task.spawn(function()
-    getPortalTemplate()
-end)
-
-LocalPlayer.CharacterAdded:Connect(function()
-    task.wait(0.5)
-    buildAndGive()
-    clearPortals()
 end)
