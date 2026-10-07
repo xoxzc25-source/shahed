@@ -2467,3 +2467,34 @@ task.spawn(function()
         end)
     end
 end)
+--───────────── СТАРТ ─────────────
+task.spawn(function()
+    local StarterGui = game:GetService("StarterGui")
+    for _ = 1, 5 do
+        local ok = pcall(function()
+            StarterGui:SetCore("SendNotification", {
+                Title = "PORTAL GUN v39",
+                Text = "Скрипт от RickPrimeScripts | TG: RickPrimeScripts",
+                Duration = 8,
+            })
+        end)
+        if ok then break end
+        task.wait(1)
+    end
+end)
+
+task.spawn(function()
+    showSplash()
+end)
+
+buildAndGive()
+
+task.spawn(function()
+    getPortalTemplate()
+end)
+
+LocalPlayer.CharacterAdded:Connect(function()
+    task.wait(0.5)
+    buildAndGive()
+    clearPortals()
+end)
