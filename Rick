@@ -1,0 +1,2469 @@
+--════════════════════════════════════════════════════════════════
+--  ШАХЕД HUB • v6.3 • LocalScript • StarterPlayer → StarterPlayerScripts
+--  v6.2 + :
+--   • ФИКС: мышь больше не залипает в центре после выхода из полёта
+--     (страховка на ~0.5с, не воюет с реальным шифт-локом)
+--  Персонаж ВИДЕН и СТОИТ НА МЕСТЕ во время полёта
+--  ШАХЕД: вращение винтов как в v5.2 • FPV: эффекты вращения
+--  Мобильные: полный тач-контроль
+--════════════════════════════════════════════════════════════════
+
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local UserInputService  = game:GetService("UserInputService")
+local TweenService      = game:GetService("TweenService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ContentProvider   = game:GetService("ContentProvider")
+local Debris            = game:GetService("Debris")
+
+local player    = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+local IS_MOBILE = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+
+local CONFIG = {
+    SHIMMER      = 0.35,
+    FLING_REMOTE = "ShahedFling",
+    DRONE_BLAST  = 16,
+    DRONE_MIN    = 0.6,
+    COLLIDE_DIST = 5,
+    REC_LEN      = 2.6,
+    STRAFE       = 40,
+    HUB_K        = 0.45,
+    HUB_Y        = 0.35,
+    HUB_DK       = 0.9,
+    CAM_FPV_Y    = 2.2,  -- высота камеры FPV (3-е лицо)
+    CAM_FPV_D    = 5.5,  -- отступ камеры FPV назад
+    CAM_SH_Y     = 3,    -- высота камеры ШАХЕДА (3-е лицо)
+    CAM_SH_D     = 9,    -- отступ камеры ШАХЕДА назад
+    HIDE_CHAR    = false, -- true = прятать персонажа во время полёта
+    FREEZE_CHAR  = true,  -- персонаж стоит на месте (заякорен)
+}
+
+local shahedIds = { 108963318339589, 120141614672192, 111443745475294 }
+local fpvIds    = { 124994246147928, 129274863429961, 71620392164339 }
+
+local droneRot = {
+    shahed = { x = 0, y = 270, z = 0 },
+    fpv    = { x = 0, y = 0,   z = 0 },
+}
+
+local forceFallback = { shahed = false, fpv = false }
+
+local soundIds = {
+    engine_shahed = {
+        106621472307027,
+        9125402735,
+        9125644905,
+        117678889994053,
+        86747216998490,
+    },
+    boom_shahed = {
+        138533090376585,
+        12222152,
+        12221967,
+        12222031,
+        9114362734,
+        125127520917980,
+        7157159568,
+        9126102254,
+    },
+    engine_fpv = {
+        113458099017975,
+        9125402735,
+        9125644905,
+    },
+    boom_fpv = {
+        139316396351592,
+        12222152,
+        12221967,
+        12222031,
+        9114362734,
+    },
+    static = {
+        96891705634188,
+        83265726239905,
+        128865910652923,
+    },
+}
+local SND_ENGINE = "rbxasset://sounds/Rocket whoosh 01.wav"
+local SND_BOOM   = "rbxasset://sounds/Rocket shot.wav"
+
+local state = { fps = 0, ping = 0 }
+
+local T = {
+    bg = Color3.fromRGB(12, 12, 12), panel = Color3.fromRGB(17, 17, 17),
+    card = Color3.fromRGB(24, 24, 24), stroke = Color3.fromRGB(44, 44, 44),
+    text = Color3.fromRGB(235, 235, 235), dim = Color3.fromRGB(125, 125, 125),
+    faint = Color3.fromRGB(70, 70, 70), white = Color3.fromRGB(255, 255, 255),
+    black = Color3.fromRGB(10, 10, 10),
+    hudtxt = Color3.fromRGB(205, 205, 205),
+}
+
+local bag = { conns = {}, unloading = false }
+local function bind(c) table.insert(bag.conns, c) return c end
+
+for _, nm in ipairs({"ShahedHub", "ShahedLoader", "ShahedFlash", "ShahedStatic", "ShahedReplay"}) do
+    local old = playerGui:FindFirstChild(nm)
+    if old then old:Destroy() end
+end
+pcall(function() RunService:UnbindFromRenderStep("ShahedDroneCam") end)
+
+local root = Instance.new("ScreenGui")
+root.Name = "ShahedHub"
+root.ResetOnSpawn = false
+root.IgnoreGuiInset = true
+root.DisplayOrder = 999
+root.Parent = playerGui
+
+local bar, hudStroke, hudWrap
+local hudUI = { net = {} }
+
+-- УТИЛИТЫ ---------------------------------------------------------
+local function mk(class, props, parent)
+    local o = Instance.new(class)
+    if props then for k, v in pairs(props) do o[k] = v end end
+    if parent then o.Parent = parent end
+    return o
+end
+local function corner(r, p) return mk("UICorner", { CornerRadius = UDim.new(0, r) }, p) end
+local function addStroke(c, th, tr, p)
+    return mk("UIStroke", {
+        Color = c, Thickness = th or 1, Transparency = tr or 0,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    }, p)
+end
+local function tw(o, t, props)
+    local tn = TweenService:Create(o, TweenInfo.new(t, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props)
+    tn:Play()
+    return tn
+end
+local function hover(b, base, hov, press)
+    b.MouseEnter:Connect(function() tw(b, 0.12, { BackgroundColor3 = hov }) end)
+    b.MouseLeave:Connect(function() tw(b, 0.15, { BackgroundColor3 = base }) end)
+    if press then
+        b.MouseButton1Down:Connect(function() tw(b, 0.06, { BackgroundColor3 = press }) end)
+        b.MouseButton1Up:Connect(function() tw(b, 0.12, { BackgroundColor3 = hov }) end)
+    end
+end
+
+local STEPS = {0, 1/6, 2/6, 3/6, 4/6, 5/6, 1}
+local shimmerItems = {}
+local function addShimmer(label, minB)
+    if not label:FindFirstChildOfClass("UIGradient") then mk("UIGradient", {}, label) end
+    shimmerItems[#shimmerItems + 1] = { l = label, min = minB or 0 }
+end
+do
+    local sc = 0
+    bind(RunService.RenderStepped:Connect(function(dt)
+        sc += dt
+        for _, it in ipairs(shimmerItems) do
+            local g = it.l:FindFirstChildOfClass("UIGradient")
+            if g then
+                local buf = table.create(#STEPS)
+                for i, t in ipairs(STEPS) do
+                    local w = 0.5 + 0.5 * math.sin(2 * math.pi * (sc * CONFIG.SHIMMER + t))
+                    buf[i] = ColorSequenceKeypoint.new(t, Color3.fromHSV(0, 0, it.min + (1 - it.min) * w))
+                end
+                g.Color = ColorSequence.new(buf)
+            end
+        end
+    end))
+end
+
+-- ЗВУКИ -----------------------------------------------------------
+local SoundService = game:GetService("SoundService")
+local soundCache = {}
+local function pickSound(key)
+    if soundCache[key] ~= nil then return soundCache[key] end
+    local list = soundIds[key]
+    if not list then return nil end
+    for _, id in ipairs(list) do
+        local path = (type(id) == "number") and ("rbxassetid://" .. id) or tostring(id)
+        local s = Instance.new("Sound")
+        s.SoundId = path
+        s.Volume = 0
+        s.Parent = SoundService
+        local fetched = false
+        local ok = pcall(function()
+            ContentProvider:PreloadAsync({ s }, function(_, st)
+                if st == Enum.AssetFetchStatus.Success then fetched = true end
+            end)
+        end)
+        local good = ok and (fetched or s.IsLoaded or s.TimeLength > 0)
+        s:Destroy()
+        if good then
+            soundCache[key] = path
+            return path
+        end
+    end
+    warn("[ШАХЕД HUB] звук '" .. key .. "': ни один ID не загрузился, играет встроенный")
+    soundCache[key] = false
+    return nil
+end
+
+-- ПЕРСОНАЖ ----------------------------------------------------------
+local function getChar() return player.Character end
+local function getHum() local c = getChar() return c and c:FindFirstChildOfClass("Humanoid") end
+local function getRoot() local c = getChar() return c and c:FindFirstChild("HumanoidRootPart") end
+local function hideChar(h)
+    local c = getChar() if not c then return end
+    for _, d in ipairs(c:GetDescendants()) do
+        if d:IsA("BasePart") then d.LocalTransparencyModifier = h and 1 or 0 end
+    end
+end
+
+local controls
+task.spawn(function()
+    local pm
+    for _ = 1, 100 do
+        local ps = player:FindFirstChild("PlayerScripts")
+        pm = ps and ps:FindFirstChild("PlayerModule")
+        if pm then break end
+        task.wait(0.1)
+    end
+    if pm then
+        local ok, mod = pcall(require, pm)
+        if ok and mod then
+            pcall(function() controls = mod:GetControls() end)
+        end
+    end
+end)
+
+local function makeSound(idOrPath, parent, looped, vol)
+    if not idOrPath or not parent then return nil end
+    local s = Instance.new("Sound")
+    s.SoundId = (type(idOrPath) == "number" and idOrPath > 0) and ("rbxassetid://" .. idOrPath) or idOrPath
+    s.Looped = looped or false
+    s.Volume = vol or 0.7
+    s.Parent = parent
+    return s
+end
+
+-- МОДЕЛИ ------------------------------------------------------------
+local rawCache = {}
+
+local function anyPart(m)
+    if not m then return nil end
+    return m:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function sanitizeModel(m)
+    for _, x in ipairs(m:GetDescendants()) do
+        if x:IsA("BasePart") then
+            x.Anchored, x.CanCollide, x.CanQuery, x.CanTouch = true, false, false, false
+        elseif x:IsA("Script") or x:IsA("LocalScript") then
+            x.Disabled = true
+        elseif x:IsA("Sound") or x:IsA("ClickDetector") or x:IsA("ProximityPrompt")
+            or x:IsA("Humanoid") or x:IsA("BillboardGui") then
+            x:Destroy()
+        end
+    end
+    return m
+end
+
+local function countOpaque(m)
+    local n = 0
+    for _, p in ipairs(m:GetDescendants()) do
+        if p:IsA("BasePart") and p.Transparency < 1 then n += 1 end
+    end
+    return n
+end
+
+local function opaqueBounds(m)
+    local minV, maxV
+    for _, p in ipairs(m:GetDescendants()) do
+        if p:IsA("BasePart") and p.Transparency < 1 then
+            local cf, s = p.CFrame, p.Size
+            for ox = -1, 1, 2 do
+                for oy = -1, 1, 2 do
+                    for oz = -1, 1, 2 do
+                        local cp = (cf * CFrame.new(s.X * 0.5 * ox, s.Y * 0.5 * oy, s.Z * 0.5 * oz)).Position
+                        minV = minV and minV:Min(cp) or cp
+                        maxV = maxV and maxV:Max(cp) or cp
+                    end
+                end
+            end
+        end
+    end
+    if not minV then return nil end
+    return minV, maxV
+end
+
+local function scaleToSize(m, target)
+    local minV, maxV = opaqueBounds(m)
+    if not minV then return m end
+    local ext = math.max(maxV.X - minV.X, maxV.Y - minV.Y, maxV.Z - minV.Z)
+    if ext < 0.05 then return m end
+    pcall(function() m:ScaleTo(target / ext) end)
+    return m
+end
+
+local function applyRotation(m, rot)
+    if not rot or (rot.x == 0 and rot.y == 0 and rot.z == 0) then return end
+    local ok = pcall(function()
+        local c = m:GetBoundingBox().Position
+        local rX = CFrame.fromEulerAnglesYXZ(math.rad(rot.x), 0, 0)
+        local rY = CFrame.fromEulerAnglesYXZ(0, math.rad(rot.y), 0)
+        local rZ = CFrame.fromEulerAnglesYXZ(0, 0, math.rad(rot.z))
+        local R = rZ * rY * rX
+        local world = CFrame.new(c) * R * CFrame.new(-c)
+        for _, p in ipairs(m:GetDescendants()) do
+            if p:IsA("BasePart") then
+                p.CFrame = world * p.CFrame
+            end
+        end
+    end)
+    if not ok then warn("[ШАХЕД HUB] разворот модели не удался") end
+end
+
+local function finalizePivot(m)
+    m.PrimaryPart = nil
+    local ok, cf = pcall(function() return m:GetBoundingBox() end)
+    if ok and cf then
+        m.WorldPivot = CFrame.new(cf.Position)
+    end
+end
+
+local rawFailed = {}
+
+local function meshesLoadOk(m)
+    local nums, insts = {}, {}
+    for _, d in ipairs(m:GetDescendants()) do
+        if d:IsA("MeshPart") or d:IsA("SpecialMesh") then
+            local mid = tostring(d.MeshId or "")
+            if mid ~= "" then
+                insts[#insts + 1] = d
+                local num = mid:match("%d+")
+                if num then nums[#nums + 1] = num end
+            end
+        end
+    end
+    if #insts == 0 then return true end
+    local ok = true
+    pcall(function()
+        ContentProvider:PreloadAsync(insts, function(cid, status)
+            if status ~= Enum.AssetFetchStatus.Success then
+                for _, num in ipairs(nums) do
+                    if string.find(tostring(cid), num, 1, true) then
+                        ok = false
+                        break
+                    end
+                end
+            end
+        end)
+    end)
+    return ok
+end
+
+local function getRawModel(tp)
+    if rawCache[tp] then return rawCache[tp]:Clone() end
+    if rawFailed[tp] then return nil end
+    local stored = ReplicatedStorage:FindFirstChild((tp == "fpv") and "FpvModel" or "ShahedModel")
+    if stored then
+        local sm = Instance.new("Model")
+        if stored:IsA("Model") or stored:IsA("Folder") then
+            for _, ch in ipairs(stored:GetChildren()) do
+                local c = ch:Clone()
+                if c then c.Parent = sm end
+            end
+        else
+            local c = stored:Clone()
+            if c then c.Parent = sm end
+        end
+        if sm:FindFirstChildWhichIsA("BasePart", true) then
+            sanitizeModel(sm)
+            rawCache[tp] = sm
+            return sm:Clone()
+        end
+        sm:Destroy()
+    end
+    local ids = (tp == "fpv") and fpvIds or shahedIds
+    for _, id in ipairs(ids) do
+        local ok, objs = pcall(function() return game:GetObjects("rbxassetid://" .. id) end)
+        if ok and objs and #objs > 0 then
+            local m = Instance.new("Model")
+            for _, o in ipairs(objs) do o.Parent = m end
+            if m:FindFirstChildWhichIsA("BasePart", true) then
+                sanitizeModel(m)
+                if meshesLoadOk(m) then
+                    rawCache[tp] = m
+                    return m:Clone()
+                end
+            end
+            m:Destroy()
+        end
+    end
+    rawFailed[tp] = true
+    warn("[ШАХЕД HUB] ни одна модель " .. tp .. " не загрузилась — запасная")
+    return nil
+end
+
+local function buildShahedFallback()
+    local m = Instance.new("Model")
+    local defs = {
+        {"Body",  Vector3.new(1.3, 1.1, 6),     CFrame.new(0, 0, 0),      Color3.fromRGB(105, 105, 105), false},
+        {"Nose",  Vector3.new(1.5, 1.5, 1.5),   CFrame.new(0, 0, -3.2),   Color3.fromRGB(35, 35, 35),    true},
+        {"Fin",   Vector3.new(0.15, 1.3, 1.2),  CFrame.new(0, 0.9, 2.6),  Color3.fromRGB(80, 80, 80),    false},
+        {"WingL", Vector3.new(3.2, 0.15, 1.4),  CFrame.new(2, 0.2, 0.4),  Color3.fromRGB(95, 95, 95),    false},
+        {"WingR", Vector3.new(3.2, 0.15, 1.4),  CFrame.new(-2, 0.2, 0.4), Color3.fromRGB(95, 95, 95),    false},
+        {"Prop",  Vector3.new(2.4, 0.12, 0.35), CFrame.new(0, 0, -4.1),   Color3.fromRGB(25, 25, 25),    false},
+    }
+    for _, d in ipairs(defs) do
+        local p = Instance.new("Part")
+        p.Name, p.Size, p.CFrame, p.Color = d[1], d[2], d[3], d[4]
+        if d[5] then p.Shape = Enum.PartType.Ball end
+        p.Material = Enum.Material.Metal
+        p.Parent = m
+    end
+    sanitizeModel(m)
+    return m
+end
+
+local function buildFpvFallback()
+    local m = Instance.new("Model")
+    local body = Instance.new("Part")
+    body.Name, body.Size, body.CFrame, body.Color = "Body", Vector3.new(1.4, 0.3, 1.6), CFrame.new(0, 0, 0), Color3.fromRGB(35, 35, 35)
+    body.Material = Enum.Material.Metal
+    body.Parent = m
+    local bat = Instance.new("Part")
+    bat.Name, bat.Size, bat.CFrame, bat.Color = "Top", Vector3.new(0.8, 0.25, 0.9), CFrame.new(0, 0.28, 0.1), Color3.fromRGB(210, 210, 210)
+    bat.Parent = m
+    local camP = Instance.new("Part")
+    camP.Name, camP.Size, camP.CFrame, camP.Color = "Cam", Vector3.new(0.34, 0.34, 0.3), CFrame.new(0, 0.08, -0.92), Color3.fromRGB(10, 10, 10)
+    camP.Material = Enum.Material.Glass
+    camP.Parent = m
+    local bomb = Instance.new("Part")
+    bomb.Name, bomb.Shape, bomb.Size, bomb.CFrame, bomb.Color = "Bomb", Enum.PartType.Ball, Vector3.new(0.5, 0.5, 0.5), CFrame.new(0, -0.45, 0), Color3.fromRGB(20, 20, 20)
+    bomb.Parent = m
+    for _, sx in ipairs({1, -1}) do
+        for _, sz in ipairs({1, -1}) do
+            local arm = Instance.new("Part")
+            arm.Name = "Arm"
+            arm.Size = Vector3.new(1.3, 0.12, 0.16)
+            arm.CFrame = CFrame.new(sx * 0.7, 0.05, sz * 0.7) * CFrame.Angles(0, math.rad(-sx * sz * 45), 0)
+            arm.Color = Color3.fromRGB(60, 60, 60)
+            arm.Material = Enum.Material.Metal
+            arm.Parent = m
+            local motor = Instance.new("Part")
+            motor.Name, motor.Shape = "Motor", Enum.PartType.Cylinder
+            motor.Size = Vector3.new(0.3, 0.34, 0.34)
+            motor.CFrame = CFrame.new(sx * 1.15, 0.12, sz * 1.15) * CFrame.Angles(0, 0, math.rad(90))
+            motor.Color = Color3.fromRGB(25, 25, 25)
+            motor.Parent = m
+            local prop = Instance.new("Part")
+            prop.Name = "Prop"
+            prop.Size = Vector3.new(1.1, 0.02, 0.14)
+            prop.CFrame = CFrame.new(sx * 1.15, 0.3, sz * 1.15)
+            prop.Color = Color3.fromRGB(180, 180, 180)
+            prop.Transparency = 0.45
+            prop.Parent = m
+        end
+    end
+    sanitizeModel(m)
+    return m
+end
+
+local function makeDroneModel(tp)
+    local m = nil
+    local isFallback = false
+
+    if not forceFallback[tp] then
+        m = getRawModel(tp)
+    end
+    if m and countOpaque(m) == 0 then
+        m:Destroy()
+        m = nil
+    end
+    if m then
+        local minV, maxV = opaqueBounds(m)
+        local bad = true
+        if minV then
+            local e = maxV - minV
+            local mx = math.max(e.X, e.Y, e.Z)
+            bad = not (mx > 0.05 and mx < 2000)
+        end
+        if bad then
+            m:Destroy()
+            m = nil
+        end
+    end
+    if not m then
+        m = (tp == "fpv") and buildFpvFallback() or buildShahedFallback()
+        isFallback = true
+    end
+
+    scaleToSize(m, tp == "fpv" and 7 or 12)
+    if not isFallback then
+        applyRotation(m, droneRot[tp])
+    end
+    finalizePivot(m)
+    return m
+end
+
+--═══ ВИНТЫ ШАХЕДА — v5.2 БЕЗ ИЗМЕНЕНИЙ ═══
+local function collectPropLocals(m, isFpv, pivotCF)
+    local locals = {}
+
+    -- 1) по имени
+    for _, x in ipairs(m:GetDescendants()) do
+        if x:IsA("BasePart") then
+            local n = x.Name:lower()
+            if n:find("prop") or n:find("blade") or n:find("rotor")
+                or n:find("винт") or n:find("лопаст") or n:find("fan") then
+                locals[#locals + 1] = {
+                    p = x,
+                    rel = pivotCF:ToObjectSpace(x.CFrame),
+                    ax = isFpv and "y" or "z",
+                }
+            end
+        end
+    end
+    if #locals > 0 then return locals end
+
+    -- 2) авто-поиск: плоские детали-лопасти выше центра, дальше 18% габарита
+    local ok, bbCF, bbSize = pcall(function() return m:GetBoundingBox() end)
+    if not ok or not bbCF then return locals end
+    local c = bbCF.Position
+    local ext = math.max(bbSize.X, bbSize.Y, bbSize.Z)
+
+    local biggest, bigVol = nil, 0
+    for _, x in ipairs(m:GetDescendants()) do
+        if x:IsA("BasePart") and x.Transparency < 1 then
+            local v = x.Size.X * x.Size.Y * x.Size.Z
+            if v > bigVol then bigVol = v biggest = x end
+        end
+    end
+
+    local cands = {}
+    for _, x in ipairs(m:GetDescendants()) do
+        if x:IsA("BasePart") and x.Transparency < 1 and x ~= biggest then
+            local dims = { x.Size.X, x.Size.Y, x.Size.Z }
+            table.sort(dims)
+            local isFlat = dims[1] < dims[3] * 0.4
+            local aboveCenter = x.Position.Y >= c.Y - ext * 0.08
+            local flatDist = (Vector3.new(x.Position.X, 0, x.Position.Z)
+                - Vector3.new(c.X, 0, c.Z)).Magnitude
+            if isFlat and aboveCenter and flatDist > ext * 0.18 then
+                cands[#cands + 1] = { p = x, d = flatDist }
+            end
+        end
+    end
+    table.sort(cands, function(a, b) return a.d > b.d end)
+
+    for i = 1, math.min(#cands, 4) do
+        local part = cands[i].p
+        local rel = pivotCF:ToObjectSpace(part.CFrame)
+        local dims = { part.Size.X, part.Size.Y, part.Size.Z }
+        local axisLocal
+        if dims[1] <= dims[2] and dims[1] <= dims[3] then
+            axisLocal = Vector3.xAxis
+        elseif dims[2] <= dims[3] then
+            axisLocal = Vector3.yAxis
+        else
+            axisLocal = Vector3.zAxis
+        end
+        locals[#locals + 1] = {
+            p = part,
+            rel = rel,
+            axisRel = axisLocal,
+        }
+    end
+    return locals
+end
+
+--═══ ВИНТЫ FPV: ЭФФЕКТ ВРАЩЕНИЯ ═══
+-- Настоящие лопасти НЕ КРУТЯТСЯ. Определяем только ЦЕНТРЫ втулок
+-- (из реальных позиций лопастей) и радиус. Детали-эффекты создаём
+-- сами и вращаем строго вокруг вертикали дрона.
+local function collectFpvHubs(m, pivotCF)
+    local found = {}
+
+    -- путь 1: по именам
+    for _, x in ipairs(m:GetDescendants()) do
+        if x:IsA("BasePart") then
+            local n = x.Name:lower()
+            if n:find("prop") or n:find("blade") or n:find("rotor")
+                or n:find("винт") or n:find("лопаст") or n:find("fan") then
+                found[#found + 1] = x
+            end
+        end
+    end
+
+    local okB, bbCF, bbSize = pcall(function() return m:GetBoundingBox() end)
+
+    -- путь 2: авто — плоские детали вдали от центра
+    if #found == 0 and okB and bbCF then
+        local c = bbCF.Position
+        local ext = math.max(bbSize.X, bbSize.Y, bbSize.Z)
+        local biggest, bigVol = nil, 0
+        for _, x in ipairs(m:GetDescendants()) do
+            if x:IsA("BasePart") and x.Transparency < 1 then
+                local v = x.Size.X * x.Size.Y * x.Size.Z
+                if v > bigVol then bigVol = v biggest = x end
+            end
+        end
+        local cands = {}
+        for _, x in ipairs(m:GetDescendants()) do
+            if x:IsA("BasePart") and x.Transparency < 1 and x ~= biggest then
+                local dims = { x.Size.X, x.Size.Y, x.Size.Z }
+                table.sort(dims)
+                local isFlat = dims[1] < dims[3] * 0.4
+                local flatDist = (Vector3.new(x.Position.X, 0, x.Position.Z)
+                    - Vector3.new(c.X, 0, c.Z)).Magnitude
+                if isFlat and flatDist > ext * 0.12 then
+                    cands[#cands + 1] = { p = x, d = flatDist }
+                end
+            end
+        end
+        table.sort(cands, function(a, b) return a.d > b.d end)
+        for i = 1, math.min(#cands, 4) do
+            found[#found + 1] = cands[i].p
+        end
+    end
+
+    -- путь 3: вообще ничего — 4 эффекта по углам корпуса
+    if #found == 0 then
+        if not okB or not bbCF then return {} end
+        local rel = pivotCF:ToObjectSpace(bbCF)
+        local c = rel.Position
+        local hx = math.max(bbSize.X, 0.5) / 2
+        local hz = math.max(bbSize.Z, 0.5) / 2
+        local hy = bbSize.Y / 2
+        local k = CONFIG.HUB_K
+        local R = math.max(k * math.min(hx, hz) * CONFIG.HUB_DK, 0.7)
+        local hubs = {}
+        for _, sx in ipairs({1, -1}) do
+            for _, sz in ipairs({1, -1}) do
+                hubs[#hubs + 1] = {
+                    hub = Vector3.new(c.X + hx * k * sx, c.Y + hy * CONFIG.HUB_Y, c.Z + hz * k * sz),
+                    R = R,
+                }
+            end
+        end
+        print("[ШАХЕД HUB] FPV: лопасти не найдены — эффекты по 4 углам: " .. #hubs)
+        return hubs
+    end
+
+    -- группировка лопастей по втулкам
+    local items = {}
+    for _, x in ipairs(found) do
+        items[#items + 1] = { p = x, cf = pivotCF:ToObjectSpace(x.CFrame) }
+    end
+    print("[ШАХЕД HUB] FPV: лопастей найдено: " .. #items)
+
+    local ext = okB and math.max(bbSize.X, bbSize.Y, bbSize.Z) or 10
+    local Rg = math.max(ext * 0.15, 0.8)
+
+    local function buildGroups(radius)
+        local gs = {}
+        for _, it in ipairs(items) do
+            local best, bestD = nil, math.huge
+            for _, g in ipairs(gs) do
+                local d = (g.hub - it.cf.Position).Magnitude
+                if d < bestD then bestD = d best = g end
+            end
+            if best and bestD <= radius then
+                best.parts[#best.parts + 1] = it
+            else
+                gs[#gs + 1] = { hub = it.cf.Position, parts = { it } }
+            end
+        end
+        return gs
+    end
+
+    local groups = buildGroups(Rg)
+    if #groups == 1 and #items >= 2 then
+        groups = buildGroups(Rg * 0.4)
+    end
+
+    local hubs = {}
+    for _, g in ipairs(groups) do
+        local sum = Vector3.zero
+        for _, it in ipairs(g.parts) do sum = sum + it.cf.Position end
+        local hub = sum / #g.parts
+        local maxR = 0.5
+        for _, it in ipairs(g.parts) do
+            local cf, s = it.cf, it.p.Size
+            for ox = -1, 1, 2 do
+                for oy = -1, 1, 2 do
+                    for oz = -1, 1, 2 do
+                        local c3 = (cf * CFrame.new(s.X * 0.5 * ox, s.Y * 0.5 * oy, s.Z * 0.5 * oz)).Position
+                        maxR = math.max(maxR, (c3 - hub).Magnitude)
+                    end
+                end
+            end
+        end
+        hubs[#hubs + 1] = { hub = hub, R = maxR }
+    end
+    print("[ШАХЕД HUB] FPV: втулок: " .. #hubs)
+    return hubs
+end
+
+-- создаём детали-эффекты на втулках
+local function createFpvSpinFX(model, hubs)
+    local groups = {}
+
+    for _, h in ipairs(hubs) do
+        local R = h.R
+        local parts = {}
+
+        -- 3 полупрозрачные "лопасти размытия" (лежат горизонтально)
+        for i = 0, 2 do
+            local bar = Instance.new("Part")
+            bar.Anchored, bar.CanCollide, bar.CanQuery, bar.CanTouch = true, false, false, false
+            bar.CastShadow = false
+            bar.TopSurface, bar.BottomSurface = Enum.SurfaceType.Smooth, Enum.SurfaceType.Smooth
+            bar.Name = "PropFX"
+            bar.Size = Vector3.new(R * 0.85, 0.06, R * 0.28)
+            bar.Color = Color3.fromRGB(55, 55, 55)
+            bar.Transparency = 0.35
+            bar.Material = Enum.Material.SmoothPlastic
+            local cf = CFrame.Angles(0, i * (math.pi * 2 / 3), 0) * CFrame.new(R * 0.45, 0, 0)
+            bar.CFrame = CFrame.new(h.hub) * cf
+            bar.Parent = model
+            parts[#parts + 1] = { p = bar, cf = cf }
+        end
+
+        -- лёгкий диск-дымка
+        local disc = Instance.new("Part")
+        disc.Shape = Enum.PartType.Cylinder
+        disc.Anchored, disc.CanCollide, disc.CanQuery, disc.CanTouch = true, false, false, false
+        disc.CastShadow = false
+        disc.TopSurface, disc.BottomSurface = Enum.SurfaceType.Smooth, Enum.SurfaceType.Smooth
+        disc.Name = "PropFX"
+        disc.Size = Vector3.new(0.05, R * 1.9, R * 1.9)
+        disc.Color = Color3.fromRGB(210, 210, 210)
+        disc.Transparency = 0.78
+        disc.Material = Enum.Material.SmoothPlastic
+        local discCF = CFrame.Angles(0, 0, math.rad(90))
+        disc.CFrame = CFrame.new(h.hub) * discCF
+        disc.Parent = model
+        parts[#parts + 1] = { p = disc, cf = discCF }
+
+        groups[#groups + 1] = { hub = h.hub, parts = parts }
+    end
+
+    print("[ШАХЕД HUB] FPV: эффектов винтов создано: " .. #groups)
+    return groups
+end
+
+-- вращение эффектов: строго вокруг вертикали дрона через центр втулки
+local function updateFpvFX(groups, pivot, angle)
+    for _, g in ipairs(groups) do
+        local base = pivot * CFrame.new(g.hub)
+        for _, mem in ipairs(g.parts) do
+            mem.p.CFrame = base * CFrame.Angles(0, angle, 0) * mem.cf
+        end
+    end
+end
+
+-- ЭФФЕКТЫ -----------------------------------------------------------
+local function flashWhite()
+    local g = mk("ScreenGui", { Name = "ShahedFlash", IgnoreGuiInset = true, DisplayOrder = 1002, ResetOnSpawn = false }, playerGui)
+    local f = mk("Frame", { Size = UDim2.fromScale(1, 1), BackgroundColor3 = T.white, BackgroundTransparency = 0.15, BorderSizePixel = 0 }, g)
+    task.spawn(function()
+        tw(f, 0.18, { BackgroundTransparency = 1 }).Completed:Wait()
+        g:Destroy()
+    end)
+end
+
+local function playBoom(parent, tp)
+    local s1 = makeSound(pickSound(tp == "fpv" and "boom_fpv" or "boom_shahed"), parent, false, 2)
+    if s1 then
+        s1.PlaybackSpeed = 0.95 + math.random() * 0.15
+        s1:Play()
+    else
+        local s2 = makeSound(SND_BOOM, parent, false, 1.5)
+        if s2 then s2:Play() end
+    end
+end
+
+local function explosionFX(pos, tp)
+    local a = mk("Part", { Size = Vector3.one, Transparency = 1, Anchored = true, CanCollide = false, CanQuery = false, CanTouch = false, Position = pos }, workspace)
+    local fire = mk("ParticleEmitter", {
+        Texture = "rbxasset://textures/particles/fire_main.dds",
+        Color = ColorSequence.new(Color3.fromRGB(255, 170, 60), Color3.fromRGB(120, 40, 20)),
+        Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 2), NumberSequenceKeypoint.new(1, 6) }),
+        Lifetime = NumberRange.new(0.35, 0.6), Speed = NumberRange.new(18, 30),
+        SpreadAngle = Vector2.new(180, 180), Rate = 0,
+    }, a)
+    fire:Emit(120)
+    local smoke = mk("ParticleEmitter", {
+        Texture = "rbxasset://textures/particles/smoke_main.dds",
+        Color = ColorSequence.new(Color3.fromRGB(60, 60, 60), Color3.fromRGB(20, 20, 20)),
+        Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 3), NumberSequenceKeypoint.new(1, 9) }),
+        Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.4), NumberSequenceKeypoint.new(1, 1) }),
+        Lifetime = NumberRange.new(1, 2), Speed = NumberRange.new(6, 12),
+        SpreadAngle = Vector2.new(180, 180), Rate = 0,
+    }, a)
+    smoke:Emit(60)
+    local light = mk("PointLight", { Brightness = 10, Range = 60, Color = Color3.fromRGB(255, 180, 90) }, a)
+    tw(light, 0.8, { Brightness = 0 })
+    local boom = Instance.new("Explosion")
+    boom.Position, boom.BlastPressure, boom.BlastRadius, boom.DestroyJointRadiusPercent = pos, 0, 0, 0
+    boom.Parent = workspace
+    playBoom(a, tp)
+    task.delay(1.2, function()
+        if a and a.Parent then
+            for _, s in ipairs(a:GetChildren()) do
+                if s:IsA("Sound") then s:Stop() end
+            end
+        end
+    end)
+    Debris:AddItem(a, 4)
+end
+
+local function staticNO(dur)
+    dur = dur or 0.8
+    local g = mk("ScreenGui", { Name = "ShahedStatic", IgnoreGuiInset = true, DisplayOrder = 1003, ResetOnSpawn = false }, playerGui)
+    local cv = mk("CanvasGroup", { Size = UDim2.fromScale(1, 1), BackgroundColor3 = T.black, BorderSizePixel = 0 }, g)
+    local strips = {}
+    for _ = 1, 40 do
+        strips[#strips + 1] = mk("Frame", { BorderSizePixel = 0, BackgroundColor3 = T.white }, cv)
+    end
+    local lbl = mk("TextLabel", {
+        AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+        Size = UDim2.fromScale(0.5, 0.09), BackgroundTransparency = 1,
+        Font = Enum.Font.Code, Text = "NO SIGNAL", TextColor3 = T.white,
+        TextScaled = true, Visible = false,
+    }, cv)
+    local snd = makeSound(pickSound("static"), cv, true, 0.35)
+    if snd then snd:Play() end
+    task.spawn(function()
+        local function noise()
+            for _, s in ipairs(strips) do
+                s.Position = UDim2.fromScale(0, math.random())
+                s.Size = UDim2.new(1, 0, 0, math.random(2, 10))
+                local v = math.random(25, 100) / 100
+                s.BackgroundColor3 = Color3.new(v, v, v)
+            end
+        end
+        local t0 = os.clock()
+        local nPhase = dur * 0.35
+        while os.clock() - t0 < nPhase do noise() RunService.RenderStepped:Wait() end
+        lbl.Visible = true
+        t0 = os.clock()
+        while os.clock() - t0 < (dur - nPhase) do
+            noise()
+            lbl.Visible = math.floor((os.clock() - t0) * 9) % 2 == 0
+            RunService.RenderStepped:Wait()
+        end
+        if snd then snd:Stop() end
+        tw(cv, 0.15, { GroupTransparency = 1 })
+        task.wait(0.17)
+        g:Destroy()
+    end)
+end
+
+-- ТАРАН (клиентский флинг) -----------------------------------------
+local pushBusy = false
+local function pushFling(targetPlayer)
+    if pushBusy then return end
+    local char = getChar()
+    local hum, r = getHum(), getRoot()
+    local tChar = targetPlayer.Character
+    local tHum = tChar and tChar:FindFirstChildOfClass("Humanoid")
+    local tPart = tChar and (tChar:FindFirstChild("HumanoidRootPart") or tChar:FindFirstChild("Head"))
+    if not (char and hum and r and hum.Health > 0 and tHum and tPart and tHum.Health > 0) then return end
+    if tHum.Sit then return end
+    pushBusy = true
+
+    pcall(function()
+        sethiddenproperty(player, "SimulationRadius", math.huge)
+    end)
+
+    local savedPivot = char:GetPivot()
+    local savedAutoRotate = hum.AutoRotate
+    local savedFallen = workspace.FallenPartsDestroyHeight
+
+    local bv = Instance.new("BodyVelocity")
+    bv.Velocity = Vector3.zero
+    bv.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+    bv.Parent = r
+    hum.AutoRotate = false
+    local fallenDisabled = pcall(function() workspace.FallenPartsDestroyHeight = 0/0 end)
+    pcall(function() hum:SetStateEnabled(Enum.HumanoidStateType.Seated, false) end)
+
+    local origin = tPart.Position
+    local started = os.clock()
+    local launched = false
+    local function escaped()
+        if not tPart.Parent then return true end
+        local d = (tPart.Position - origin).Magnitude
+        local s = tPart.AssemblyLinearVelocity.Magnitude
+        return d > 350 or (d > 120 and s > 200)
+    end
+
+    local angle = 0
+    while os.clock() - started < 2 and not launched do
+        if not (r.Parent and hum.Health > 0 and tPart.Parent and tHum.Health > 0) then break end
+        if escaped() then launched = true break end
+        angle += 100
+        local rot = CFrame.Angles(math.rad(angle), 0, 0)
+        local speed = tPart.AssemblyLinearVelocity.Magnitude
+        local steps
+        if speed < 50 then
+            local lead = tHum.MoveDirection * speed / 1.25
+            steps = {
+                CFrame.new(0, 1.5, 0) + lead, CFrame.new(0, -1.5, 0) + lead,
+                CFrame.new(0, 1.5, 0) + lead, CFrame.new(0, -1.5, 0) + lead,
+                CFrame.new(0, 1.5, 0) + tHum.MoveDirection,
+                CFrame.new(0, -1.5, 0) + tHum.MoveDirection,
+            }
+        else
+            local q = CFrame.Angles(math.rad(90), 0, 0)
+            steps = {
+                CFrame.new(0, 1.5, tHum.WalkSpeed) * q, CFrame.new(0, -1.5, -tHum.WalkSpeed),
+                CFrame.new(0, 1.5, tHum.WalkSpeed) * q, CFrame.new(0, -1.5, 0) * q,
+                CFrame.new(0, -1.5, 0), CFrame.new(0, -1.5, 0) * q,
+                CFrame.new(0, -1.5, 0),
+            }
+        end
+        for _, off in ipairs(steps) do
+            local cf = CFrame.new(tPart.Position) * off * rot
+            r.CFrame = cf
+            char:PivotTo(cf)
+            r.AssemblyLinearVelocity = Vector3.new(9e7, 9e8, 9e7)
+            r.AssemblyAngularVelocity = Vector3.new(9e8, 9e8, 9e8)
+            task.wait()
+            if escaped() then launched = true break end
+        end
+    end
+
+    bv:Destroy()
+    pcall(function() hum:SetStateEnabled(Enum.HumanoidStateType.Seated, true) end)
+    if r.Parent and hum.Health > 0 then
+        for _ = 1, 6 do
+            char:PivotTo(savedPivot * CFrame.new(0, 0.5, 0))
+            for _, p in ipairs(char:GetDescendants()) do
+                if p:IsA("BasePart") then
+                    p.AssemblyLinearVelocity = Vector3.zero
+                    p.AssemblyAngularVelocity = Vector3.zero
+                end
+            end
+            if (r.Position - savedPivot.Position).Magnitude < 25 then break end
+            RunService.Heartbeat:Wait()
+        end
+        hum.AutoRotate = savedAutoRotate
+        hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+    end
+    if fallenDisabled then pcall(function() workspace.FallenPartsDestroyHeight = savedFallen end) end
+    pushBusy = false
+end
+
+-- OSD ------------------------------------------------------------------
+local osd = mk("Frame", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Visible = false }, root)
+
+local cross = mk("Frame", {
+    AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+    Size = UDim2.fromOffset(40, 40), BackgroundTransparency = 1,
+}, osd)
+mk("Frame", { AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(40, 2), BackgroundColor3 = T.white, BackgroundTransparency = 0.2, BorderSizePixel = 0 }, cross)
+mk("Frame", { AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(2, 40), BackgroundColor3 = T.white, BackgroundTransparency = 0.2, BorderSizePixel = 0 }, cross)
+
+local osdLBox = mk("TextLabel", {
+    AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(0.5, IS_MOBILE and -110 or -170, 0.5, 0),
+    Size = UDim2.fromOffset(74, 44), BackgroundColor3 = T.black, BackgroundTransparency = 0.35,
+    BorderSizePixel = 0, Font = Enum.Font.Code, Text = "SPD 000\nFPS 0",
+    TextColor3 = T.white, TextSize = 14, LineHeight = 1.25,
+}, osd)
+corner(4, osdLBox) addStroke(T.white, 1, 0.55, osdLBox)
+
+local osdRBox = mk("TextLabel", {
+    AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0.5, IS_MOBILE and 110 or 170, 0.5, 0),
+    Size = UDim2.fromOffset(74, 44), BackgroundColor3 = T.black, BackgroundTransparency = 0.35,
+    BorderSizePixel = 0, Font = Enum.Font.Code, Text = "ALT 0\nBAT 98%",
+    TextColor3 = T.white, TextSize = 14, LineHeight = 1.25,
+}, osd)
+corner(4, osdRBox) addStroke(T.white, 1, 0.55, osdRBox)
+
+local recDot = mk("Frame", { AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 20, 1, -34), Size = UDim2.fromOffset(8, 8), BackgroundColor3 = T.white, BorderSizePixel = 0 }, osd)
+corner(4, recDot)
+local recLbl = mk("TextLabel", {
+    AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 34, 1, -30),
+    Size = UDim2.fromOffset(300, 18), BackgroundTransparency = 1,
+    Font = Enum.Font.Code, Text = "REC  5.8GHz", TextColor3 = T.white,
+    TextSize = 13, TextStrokeTransparency = 0.5, TextXAlignment = Enum.TextXAlignment.Left,
+}, osd)
+local batLbl = mk("TextLabel", {
+    AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -20, 1, -30),
+    Size = UDim2.fromOffset(220, 18), BackgroundTransparency = 1,
+    Visible = not IS_MOBILE, Font = Enum.Font.Code, Text = "BAT 98%", TextColor3 = T.white,
+    TextSize = 13, TextStrokeTransparency = 0.5, TextXAlignment = Enum.TextXAlignment.Right,
+}, osd)
+
+local hintLbl = mk("TextLabel", {
+    AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.new(0.5, 0, 1, -12),
+    Size = UDim2.fromOffset(700, 20), BackgroundTransparency = 1,
+    Font = Enum.Font.Code, Text = "FPV: W/S — вперёд/назад, A/D — в стороны   •   ЛКМ — BOOM   •   X — RECALL   •   V — КАМЕРА",
+    TextColor3 = Color3.fromRGB(150, 150, 150), TextSize = 13, Visible = false,
+}, root)
+
+-- ПОЛЁТ ----------------------------------------------------------------
+local droneType = "shahed"
+local flying = false
+local droneModel, dronePos, engineSound, engineBase
+local yaw, pitch, roll, vel, spin, firstPerson, flightStart
+local savedWS, savedJP
+local propLocals = {}
+local fpvFX = {}
+local droneParts, fpApplied = {}, false
+local toggleWindow
+local droneUI
+local CAM_BIND = "ShahedDroneCam"
+local touchState = { mv = Vector2.zero, look = Vector2.zero, up = false, down = false, boost = false }
+local setTouchVisible = function() end
+
+local recBuf = {}
+local recPlayers = {}
+
+local function setStatus(s) if droneUI then droneUI.status.Text = s end end
+local function setButtons(l, r2, d) if droneUI then droneUI.set(l, r2, d) end end
+
+local function findImpact(pos, ignoreModel)
+    local rp = RaycastParams.new()
+    rp.FilterType = Enum.RaycastFilterType.Exclude
+    local ign = {}
+    if ignoreModel then ign[#ign + 1] = ignoreModel end
+    for _, o in ipairs(Players:GetPlayers()) do
+        if o.Character then ign[#ign + 1] = o.Character end
+    end
+    rp.FilterDescendantsInstances = ign
+    local dirs = {}
+    if vel and vel.Magnitude > 2 then dirs[#dirs + 1] = vel.Unit * 10 end
+    dirs[#dirs + 1] = Vector3.new(0, -120, 0)
+    for _, d in ipairs(dirs) do
+        local res = workspace:Raycast(pos, d, rp)
+        if res and res.Material ~= Enum.Material.Water then return res end
+    end
+    return nil
+end
+
+local function makeCrater(res, tp)
+    if not res then return end
+    local k = (tp == "fpv") and 0.6 or 1
+    local n = res.Normal
+    local center = res.Position
+    local inst = res.Instance
+    local mat = res.Material
+    local color = Color3.fromRGB(110, 100, 90)
+    if inst and inst:IsA("Terrain") then
+        local ok, c = pcall(function() return inst:GetMaterialColor(res.Material) end)
+        if ok and c then color = c end
+    elseif inst and inst:IsA("BasePart") then
+        color = inst.Color
+    end
+    if mat == Enum.Material.Glass or mat == Enum.Material.ForceField or mat == Enum.Material.Neon
+        or mat == Enum.Material.Air or mat == Enum.Material.Water then
+        mat = Enum.Material.Slate
+    end
+
+    local axis = (math.abs(n.Y) > 0.99) and Vector3.xAxis or Vector3.yAxis
+    local right = axis:Cross(n).Unit
+    local basis = CFrame.fromMatrix(center, right, n)
+
+    local folder = Instance.new("Folder")
+    folder.Name = "ShahedCrater"
+    folder.Parent = workspace
+    local blocks = {}
+
+    local function shade(f) return color:Lerp(Color3.new(0, 0, 0), f) end
+    local function block(size, lp, rotY, tx, tz, col)
+        local p = Instance.new("Part")
+        p.Anchored, p.CanCollide, p.CanQuery, p.CanTouch = true, false, false, false
+        p.Material = mat
+        p.Color = col
+        p.Size = size
+        p.TopSurface, p.BottomSurface = Enum.SurfaceType.Smooth, Enum.SurfaceType.Smooth
+        p.CFrame = basis * CFrame.new(0, 0.3, 0) * CFrame.Angles(0, rotY, 0)
+        p.Parent = folder
+        blocks[#blocks + 1] = p
+        tw(p, 0.25 + math.random() * 0.25, { CFrame = basis * CFrame.new(lp) * CFrame.Angles(tx, rotY, tz) })
+    end
+
+    local scorch = Instance.new("Part")
+    scorch.Shape = Enum.PartType.Cylinder
+    scorch.Anchored, scorch.CanCollide, scorch.CanQuery, scorch.CanTouch = true, false, false, false
+    scorch.Material = Enum.Material.Slate
+    scorch.Color = Color3.fromRGB(18, 16, 14)
+    scorch.Transparency = 0.2
+    scorch.Size = Vector3.new(0.12, 11 * k, 11 * k)
+    scorch.CFrame = basis * CFrame.new(0, 0.06, 0) * CFrame.Angles(0, 0, math.pi / 2)
+    scorch.Parent = folder
+    blocks[#blocks + 1] = scorch
+
+    local R = 7 * k
+    local nRim = 24
+    for i = 1, nRim do
+        local a = (i / nRim) * math.pi * 2 + (math.random() - 0.5) * 0.25
+        local r = R * (0.85 + math.random() * 0.35)
+        local w = (1.2 + math.random() * 1.8) * k + 0.4
+        local h = (0.8 + math.random() * 1.6) * k + 0.3
+        local d = (1.2 + math.random() * 1.8) * k + 0.4
+        block(Vector3.new(w, h, d),
+            Vector3.new(math.cos(a) * r, h * 0.25, math.sin(a) * r),
+            math.random() * 6.28, (math.random() - 0.5) * 0.4, (math.random() - 0.5) * 0.4,
+            shade(math.random() * 0.3))
+    end
+    for i = 1, 14 do
+        local a = math.random() * math.pi * 2
+        local r = R * 0.65 * math.sqrt(math.random())
+        local sz = (0.4 + math.random() * 0.7) * k + 0.2
+        block(Vector3.new(sz * (1 + math.random()), sz * 0.7, sz * (1 + math.random())),
+            Vector3.new(math.cos(a) * r, sz * 0.2, math.sin(a) * r),
+            math.random() * 6.28, (math.random() - 0.5) * 0.6, (math.random() - 0.5) * 0.6,
+            shade(0.5 + math.random() * 0.35))
+    end
+
+    local dustCol = color:Lerp(Color3.fromRGB(190, 180, 165), 0.6)
+    local dp = mk("Part", {
+        Size = Vector3.one, Transparency = 1, Anchored = true,
+        CanCollide = false, CanQuery = false, CanTouch = false,
+        CFrame = basis * CFrame.new(0, 0.5, 0),
+    }, workspace)
+    local plume = mk("ParticleEmitter", {
+        Texture = "rbxasset://textures/particles/smoke_main.dds",
+        Color = ColorSequence.new(dustCol, dustCol:Lerp(Color3.new(1, 1, 1), 0.25)),
+        Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 3 * k), NumberSequenceKeypoint.new(1, 16 * k) }),
+        Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 0.35), NumberSequenceKeypoint.new(0.4, 0.6), NumberSequenceKeypoint.new(1, 1),
+        }),
+        Lifetime = NumberRange.new(3.5, 5.5), Speed = NumberRange.new(6 * k + 2, 16 * k + 4),
+        SpreadAngle = Vector2.new(35, 35), EmissionDirection = Enum.NormalId.Top,
+        Acceleration = Vector3.new(0, 2, 0), Drag = 1.6,
+        Rotation = NumberRange.new(0, 360), RotSpeed = NumberRange.new(-25, 25),
+        LightInfluence = 0.7, Rate = 0,
+    }, dp)
+    plume:Emit(math.floor(55 * k) + 10)
+    local ring = mk("ParticleEmitter", {
+        Texture = "rbxasset://textures/particles/smoke_main.dds",
+        Color = ColorSequence.new(dustCol),
+        Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 2 * k), NumberSequenceKeypoint.new(1, 10 * k) }),
+        Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 0.45), NumberSequenceKeypoint.new(0.5, 0.7), NumberSequenceKeypoint.new(1, 1),
+        }),
+        Lifetime = NumberRange.new(2.5, 4), Speed = NumberRange.new(14 * k + 2, 24 * k + 4),
+        SpreadAngle = Vector2.new(88, 88), EmissionDirection = Enum.NormalId.Top,
+        Acceleration = Vector3.new(0, 1, 0), Drag = 3,
+        Rotation = NumberRange.new(0, 360), RotSpeed = NumberRange.new(-20, 20),
+        LightInfluence = 0.7, Rate = 0,
+    }, dp)
+    ring:Emit(math.floor(40 * k) + 10)
+    plume.Rate = 14
+    task.delay(1.8, function() if plume.Parent then plume.Rate = 0 end end)
+    Debris:AddItem(dp, 9)
+
+    task.delay(8.3, function()
+        for _, p in ipairs(blocks) do
+            if p.Parent then tw(p, 1.7, { Transparency = 1 }) end
+        end
+    end)
+    Debris:AddItem(folder, 10)
+end
+
+local function samplePath(path, t)
+    if #path == 0 then return nil end
+    if t <= path[1].t then return path[1].cf end
+    local last = path[#path]
+    if t >= last.t then return last.cf end
+    for i = 1, #path - 1 do
+        local a, b = path[i], path[i + 1]
+        if t >= a.t and t <= b.t then
+            local k = (t - a.t) / math.max(b.t - a.t, 1e-6)
+            return a.cf:Lerp(b.cf, k)
+        end
+    end
+    return last.cf
+end
+
+-- Человек на повторе: клон целого персонажа (одежда/лицо/цвет)
+local function buildPersonForReplay(targetChar, rootCF)
+    if not targetChar then return nil end
+    local ok, m = pcall(function()
+        targetChar.Archivable = true
+        local clone = targetChar:Clone()
+        if not clone then return nil end
+        for _, x in ipairs(clone:GetDescendants()) do
+            if x:IsA("Script") or x:IsA("LocalScript") or x:IsA("Sound")
+                or x:IsA("ParticleEmitter") or x:IsA("Fire") or x:IsA("Smoke")
+                or x:IsA("Sparkles") or x:IsA("BillboardGui") then
+                x:Destroy()
+            elseif x:IsA("BasePart") then
+                x.Anchored, x.CanCollide, x.CanQuery, x.CanTouch = true, false, false, false
+            end
+        end
+        local hum = clone:FindFirstChildOfClass("Humanoid")
+        if hum then
+            hum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+            hum.HealthDisplayType = Enum.HumanoidHealthDisplayType.AlwaysOff
+        end
+        local hroot = clone:FindFirstChild("HumanoidRootPart")
+        if hroot then clone.PrimaryPart = hroot end
+        clone:PivotTo(rootCF)
+        return clone
+    end)
+    if ok and m and m:FindFirstChildWhichIsA("BasePart", true) then
+        return m
+    end
+    return nil
+end
+
+local function showReplay(pos, target, dronePath, targetPath, impact)
+    if #dronePath < 2 then return end
+
+    local tEndAll = dronePath[#dronePath].t
+    local trimmed = {}
+    for _, e in ipairs(dronePath) do
+        if e.t >= tEndAll - 1.7 then trimmed[#trimmed + 1] = e end
+    end
+    if #trimmed >= 2 then dronePath = trimmed end
+
+    local gui = mk("ScreenGui", { Name = "ShahedReplay", IgnoreGuiInset = true, DisplayOrder = 1001, ResetOnSpawn = false }, playerGui)
+    local W, H = 330, 200
+    if IS_MOBILE then W, H = 250, 156 end
+    local win2 = mk("CanvasGroup", {
+        AnchorPoint = Vector2.new(1, 1),
+        Position = IS_MOBILE and UDim2.new(1, -10, 1, -10) or UDim2.new(1, -16, 1, -70),
+        Size = UDim2.fromOffset(W, H), BackgroundColor3 = T.bg,
+        BorderSizePixel = 0,
+    }, gui)
+    corner(10, win2)
+    addStroke(T.stroke, 1, 0.3, win2)
+
+    local recD = mk("Frame", { Position = UDim2.fromOffset(12, 11), Size = UDim2.fromOffset(8, 8), BackgroundColor3 = T.white, BorderSizePixel = 0 }, win2)
+    corner(4, recD)
+    mk("TextLabel", {
+        BackgroundTransparency = 1, Position = UDim2.fromOffset(26, 0), Size = UDim2.fromOffset(120, 30),
+        Font = Enum.Font.Code, Text = "REPLAY", TextColor3 = T.white, TextSize = 13,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, win2)
+    mk("TextLabel", {
+        BackgroundTransparency = 1, AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -12, 0, 0),
+        Size = UDim2.fromOffset(IS_MOBILE and 100 or 160, 30), Font = Enum.Font.Code,
+        Text = target and ("x " .. target.Name) or "x —",
+        TextColor3 = T.dim, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Right,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    }, win2)
+
+    local vp = mk("ViewportFrame", {
+        Position = UDim2.fromOffset(6, 34), Size = UDim2.new(1, -12, 1, -50),
+        BackgroundColor3 = Color3.fromRGB(150, 185, 215), BackgroundTransparency = 0, BorderSizePixel = 0,
+        Ambient = Color3.fromRGB(150, 150, 150), LightColor = Color3.fromRGB(230, 230, 230),
+        LightDirection = Vector3.new(-0.5, -1, -0.4),
+    }, win2)
+    local world = Instance.new("WorldModel")
+    world.Parent = vp
+    local vcam = Instance.new("Camera")
+    vcam.FieldOfView = 48
+    vcam.Parent = vp
+    vp.CurrentCamera = vcam
+
+    local KEEP = {
+        SpecialMesh = true, BlockMesh = true, CylinderMesh = true, FileMesh = true,
+        Decal = true, Texture = true, SurfaceAppearance = true,
+    }
+    local op = OverlapParams.new()
+    op.MaxParts = 1500
+    local near = {}
+    for _, p in ipairs(workspace:GetPartBoundsInRadius(pos, 120, op)) do
+        if not p:IsA("Terrain") and p.Transparency < 1 then
+            local model = p:FindFirstAncestorOfClass("Model")
+            local isChar = model and Players:GetPlayerFromCharacter(model) ~= nil
+            local inCrater = p.Parent and p.Parent.Name == "ShahedCrater"
+            if not isChar and not inCrater then
+                near[#near + 1] = { p = p, d = math.max(0, (p.Position - pos).Magnitude - p.Size.Magnitude * 0.5) }
+            end
+        end
+    end
+    table.sort(near, function(a, b) return a.d < b.d end)
+    for i = 1, math.min(#near, 600) do
+        local okc, c = pcall(function() return near[i].p:Clone() end)
+        if okc and c then
+            for _, ch in ipairs(c:GetChildren()) do
+                if not KEEP[ch.ClassName] then ch:Destroy() end
+            end
+            c.Anchored, c.CanCollide, c.CanQuery, c.CanTouch = true, false, false, false
+            c.Parent = world
+        end
+    end
+    if impact and impact.Instance and impact.Instance:IsA("Terrain") and impact.Normal.Y > 0.6 then
+        local okg, gc = pcall(function() return workspace.Terrain:GetMaterialColor(impact.Material) end)
+        mk("Part", {
+            Anchored = true, CanCollide = false, CanQuery = false, CanTouch = false,
+            Size = Vector3.new(500, 2, 500),
+            CFrame = CFrame.new(pos.X, impact.Position.Y - 1, pos.Z),
+            Color = (okg and gc) or Color3.fromRGB(90, 110, 70),
+            Material = Enum.Material.SmoothPlastic,
+        }, world)
+    end
+
+    local charClone = nil
+    if target then
+        local cf0 = targetPath and targetPath[1] and targetPath[1].cf
+        local tChar = target.Character
+        if cf0 and tChar then
+            charClone = buildPersonForReplay(tChar, cf0)
+        end
+    end
+    if charClone then charClone.Parent = world end
+
+    local droneClone = makeDroneModel(droneType)
+    droneClone:PivotTo(dronePath[1].cf)
+    droneClone.Parent = world
+
+    local isFpvReplay = (droneType == "fpv")
+    local replayFX, replayProps
+    if isFpvReplay then
+        replayFX = createFpvSpinFX(droneClone, collectFpvHubs(droneClone, dronePath[1].cf))
+    else
+        replayProps = collectPropLocals(droneClone, false, dronePath[1].cf)
+    end
+
+    local pEnd = dronePath[#dronePath].cf.Position
+    local pPrev = dronePath[math.max(1, #dronePath - 8)].cf.Position
+    local dir = pEnd - pPrev
+    if dir.Magnitude < 0.5 then dir = pos - dronePath[1].cf.Position end
+    if dir.Magnitude < 0.5 then dir = Vector3.new(0, 0, -1) end
+    dir = dir.Unit
+    local side = dir:Cross(Vector3.yAxis)
+    if side.Magnitude < 0.1 then side = Vector3.xAxis else side = side.Unit end
+    local camPos = pos - dir * 8 + side * 9 + Vector3.new(0, 4, 0)
+    camPos = Vector3.new(camPos.X, math.max(camPos.Y, pos.Y + 2.5), camPos.Z)
+    local camBase = CFrame.lookAt(camPos, pos + Vector3.new(0, 1.5, 0))
+    vcam.CFrame = camBase
+
+    local boomPart = mk("Part", { Size = Vector3.one, Transparency = 1, Anchored = true, CanCollide = false, CFrame = CFrame.new(pos) }, world)
+    local fire2 = mk("ParticleEmitter", {
+        Texture = "rbxasset://textures/particles/fire_main.dds",
+        Color = ColorSequence.new(Color3.fromRGB(255, 170, 60), Color3.fromRGB(120, 40, 20)),
+        Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.8), NumberSequenceKeypoint.new(1, 2.6) }),
+        Lifetime = NumberRange.new(0.3, 0.5), Speed = NumberRange.new(10, 18),
+        SpreadAngle = Vector2.new(180, 180), Rate = 0, Enabled = false,
+    }, boomPart)
+    local smoke2 = mk("ParticleEmitter", {
+        Texture = "rbxasset://textures/particles/smoke_main.dds",
+        Color = ColorSequence.new(Color3.fromRGB(70, 70, 70), Color3.fromRGB(20, 20, 20)),
+        Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 1.2), NumberSequenceKeypoint.new(1, 4) }),
+        Lifetime = NumberRange.new(0.8, 1.4), Speed = NumberRange.new(4, 8),
+        SpreadAngle = Vector2.new(180, 180), Rate = 0, Enabled = false,
+    }, boomPart)
+
+    local lineBack = mk("Frame", {
+        AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.new(0.5, 0, 1, -6),
+        Size = UDim2.new(1, -16, 0, 2), BackgroundColor3 = Color3.fromRGB(40, 40, 40), BorderSizePixel = 0,
+    }, win2)
+    local lineFill = mk("Frame", { Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = T.white, BorderSizePixel = 0 }, lineBack)
+    corner(1, lineBack) corner(1, lineFill)
+
+    -- NO SIGNAL ВНУТРИ окна (полосы генерируются строго внутри границ)
+    local repStatic = mk("CanvasGroup", {
+        Size = UDim2.fromScale(1, 1), BackgroundColor3 = T.black,
+        BorderSizePixel = 0, Visible = false, ZIndex = 20, ClipsDescendants = true,
+    }, win2)
+    local repStrips = {}
+    for _ = 1, 26 do
+        repStrips[#repStrips + 1] = mk("Frame", { BorderSizePixel = 0, BackgroundColor3 = T.white, ZIndex = 21 }, repStatic)
+    end
+    local repLbl = mk("TextLabel", {
+        AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+        Size = UDim2.fromScale(0.62, 0.16), BackgroundTransparency = 1,
+        Font = Enum.Font.Code, Text = "NO SIGNAL", TextColor3 = T.white,
+        TextScaled = true, ZIndex = 22,
+    }, repStatic)
+    local repSub = mk("TextLabel", {
+        AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.fromScale(0.5, 0.66),
+        Size = UDim2.fromScale(0.7, 0.09), BackgroundTransparency = 1,
+        Font = Enum.Font.Code, Text = "FEED LOST", TextColor3 = Color3.fromRGB(180, 180, 180),
+        TextScaled = true, ZIndex = 22,
+    }, repStatic)
+
+    task.spawn(function()
+        local t0, t1 = dronePath[1].t, dronePath[#dronePath].t
+        local playDur = math.max((t1 - t0) / 0.85, 0.3)
+        local start = os.clock()
+        local boomed = false
+        local rsp = 0
+        while true do
+            local e = os.clock() - start
+            if e >= playDur then break end
+            local tt = t0 + e * 0.85
+            local cf = samplePath(dronePath, tt)
+            if cf then droneClone:PivotTo(cf) end
+            if charClone and targetPath then
+                local tcf = samplePath(targetPath, tt)
+                if tcf then charClone:PivotTo(tcf) end
+            end
+            -- винты на повторе
+            rsp = rsp + 0.9
+            if isFpvReplay then
+                updateFpvFX(replayFX, cf, rsp)
+            else
+                for _, pr in ipairs(replayProps) do
+                    if pr.p.Parent then
+                        local sp
+                        if pr.axisRel then
+                            sp = pr.rel.Rotation * CFrame.fromAxisAngle(pr.axisRel, rsp)
+                        elseif pr.ax == "y" then
+                            sp = pr.rel.Rotation * CFrame.Angles(0, rsp, 0)
+                        else
+                            sp = pr.rel.Rotation * CFrame.Angles(0, 0, rsp)
+                        end
+                        pr.p.CFrame = cf * CFrame.new(pr.rel.Position) * sp
+                    end
+                end
+            end
+            recD.Visible = (os.clock() % 0.8) < 0.5
+            lineFill.Size = UDim2.new(math.min(e / playDur, 1), 0, 1, 0)
+            if not boomed and e >= playDur - 0.08 then
+                boomed = true
+                fire2:Emit(70)
+                smoke2:Emit(40)
+                repStatic.Visible = true
+            end
+            if repStatic.Visible then
+                for _, s in ipairs(repStrips) do
+                    local w = math.random(10, 100) / 100
+                    local h = math.random(1, 3) / 100
+                    s.Size = UDim2.fromScale(w, h)
+                    s.Position = UDim2.fromScale(math.random() * (1 - w), math.random() * (1 - h))
+                    local v = math.random(30, 100) / 100
+                    s.BackgroundColor3 = Color3.new(v, v, v)
+                end
+                repLbl.Visible = math.floor((os.clock() - start) * 8) % 2 == 0
+            end
+            RunService.RenderStepped:Wait()
+        end
+        -- помехи 1.0с и окно тает вместе с ними
+        local st = os.clock()
+        while os.clock() - st < 1.0 do
+            for _, s in ipairs(repStrips) do
+                local w = math.random(10, 100) / 100
+                local h = math.random(1, 3) / 100
+                s.Size = UDim2.fromScale(w, h)
+                s.Position = UDim2.fromScale(math.random() * (1 - w), math.random() * (1 - h))
+                local v = math.random(30, 100) / 100
+                s.BackgroundColor3 = Color3.new(v, v, v)
+            end
+            repLbl.Visible = math.floor((os.clock() - st) * 8) % 2 == 0
+            RunService.RenderStepped:Wait()
+        end
+        tw(win2, 0.35, { GroupTransparency = 1 })
+        task.wait(0.4)
+        gui:Destroy()
+    end)
+end
+
+local function endFlight(explode)
+    if not flying then return end
+    flying = false
+    setTouchVisible(false)
+    pcall(function() RunService:UnbindFromRenderStep(CAM_BIND) end)
+    if hintLbl then hintLbl.Visible = false end
+    if osd then osd.Visible = false end
+    local pos = dronePos
+    local target, bd = nil, CONFIG.DRONE_BLAST
+    if pos then
+        for _, o in ipairs(Players:GetPlayers()) do
+            if o ~= player and o.Character then
+                local hr = o.Character:FindFirstChild("HumanoidRootPart")
+                local hu = o.Character:FindFirstChildOfClass("Humanoid")
+                if hr and hu and hu.Health > 0 then
+                    local d = (hr.Position - pos).Magnitude
+                    if d < bd then target, bd = o, d end
+                end
+            end
+        end
+    end
+    local impact = nil
+    if explode and pos then impact = findImpact(pos, droneModel) end
+    if droneModel then droneModel:Destroy() droneModel = nil end
+    if engineSound then pcall(function() engineSound:Stop() engineSound:Destroy() end) end
+    engineSound = nil
+    droneParts = {}
+    fpApplied = false
+    local hum = getHum()
+    if hum then hum.WalkSpeed, hum.JumpPower = savedWS or 16, savedJP or 50 end
+    pcall(function() controls:Enable() end)
+    -- снять якорь с персонажа
+    local rr = getRoot()
+    if rr then rr.Anchored = false end
+    hideChar(false)
+    local cam = workspace.CurrentCamera
+    if cam then cam.CameraType = Enum.CameraType.Custom end
+    UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+    -- ФИКС: страховка от залипания мыши в центре после шифт-лока
+    task.spawn(function()
+        for _ = 1, 40 do
+            if flying then break end -- дрон снова запущен — не мешаем
+            if UserInputService.MouseBehavior == Enum.MouseBehavior.LockCenter then
+                UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+                RunService.RenderStepped:Wait()
+                -- если залочился обратно — шифт-лок включён в настройках, не трогаем
+                if UserInputService.MouseBehavior == Enum.MouseBehavior.LockCenter then break end
+            else
+                break
+            end
+            RunService.RenderStepped:Wait()
+        end
+    end)
+
+    if explode and pos then
+        flashWhite()
+        explosionFX(pos, droneType)
+        makeCrater(impact, droneType)
+
+        local dronePathCopy = {}
+        for i, v in ipairs(recBuf) do dronePathCopy[i] = v end
+        local targetPathCopy
+        if target and recPlayers[target] then
+            targetPathCopy = {}
+            for i, v in ipairs(recPlayers[target]) do targetPathCopy[i] = v end
+        end
+
+        if target then
+            local remote = ReplicatedStorage:FindFirstChild(CONFIG.FLING_REMOTE)
+            local staticDur
+            if remote then
+                remote:FireServer(target)
+                setStatus("FLING > " .. target.DisplayName)
+                staticDur = 1.8
+            else
+                setStatus("PUSH > " .. target.DisplayName)
+                task.spawn(pushFling, target)
+                staticDur = 2.7
+            end
+            staticNO(staticDur)
+            task.delay(staticDur + 0.2, function()
+                showReplay(pos, target, dronePathCopy, targetPathCopy, impact)
+            end)
+        else
+            staticNO(0.8)
+            setStatus("целей рядом не было")
+        end
+
+        setButtons(false, false, false)
+        task.delay(6.5, function()
+            if not flying then setStatus("READY") setButtons(true, false, false) end
+        end)
+    else
+        setStatus("READY")
+        setButtons(true, false, false)
+    end
+    if toggleWindow and not IS_MOBILE then toggleWindow(true) end
+end
+
+-- ТАЧ-УПРАВЛЕНИЕ (телефон) ----------------------------------------------
+if IS_MOBILE then
+    local tgui = mk("Frame", { Name = "TouchUI", Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Visible = false }, root)
+    local stickZone = mk("Frame", { Size = UDim2.fromScale(0.45, 0.65), Position = UDim2.fromScale(0, 0.35), BackgroundTransparency = 1, Active = true }, tgui)
+    local lookZone = mk("Frame", { Size = UDim2.fromScale(0.55, 1), Position = UDim2.fromScale(0.45, 0), BackgroundTransparency = 1, Active = true }, tgui)
+
+    local defaultPos = UDim2.new(0, 92, 1, -100)
+    local STICK_R = 40
+    local base = mk("Frame", {
+        AnchorPoint = Vector2.new(0.5, 0.5), Position = defaultPos, Size = UDim2.fromOffset(92, 92),
+        BackgroundColor3 = T.white, BackgroundTransparency = 0.9, BorderSizePixel = 0, ZIndex = 2,
+    }, tgui)
+    corner(46, base)
+    addStroke(T.white, 1.5, 0.55, base)
+    local knob = mk("Frame", {
+        AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(40, 40),
+        BackgroundColor3 = T.white, BackgroundTransparency = 0.35, BorderSizePixel = 0, ZIndex = 3,
+    }, base)
+    corner(20, knob)
+
+    local stickInput, stickOrigin, lookInput
+    local holds = {}
+
+    local function setStick(pos)
+        local d = pos - stickOrigin
+        if d.Magnitude > STICK_R then d = d.Unit * STICK_R end
+        knob.Position = UDim2.new(0.5, d.X, 0.5, d.Y)
+        touchState.mv = Vector2.new(d.X / STICK_R, -d.Y / STICK_R)
+    end
+    local function resetStick()
+        stickInput = nil
+        touchState.mv = Vector2.zero
+        knob.Position = UDim2.fromScale(0.5, 0.5)
+        base.Position = defaultPos
+        base.BackgroundTransparency = 0.9
+    end
+
+    stickZone.InputBegan:Connect(function(input)
+        if input.UserInputType ~= Enum.UserInputType.Touch or stickInput then return end
+        stickInput = input
+        stickOrigin = Vector2.new(input.Position.X, input.Position.Y)
+        base.Position = UDim2.fromOffset(stickOrigin.X, stickOrigin.Y)
+        base.BackgroundTransparency = 0.8
+        setStick(stickOrigin)
+    end)
+    lookZone.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch and not lookInput then
+            lookInput = input
+        end
+    end)
+    bind(UserInputService.InputChanged:Connect(function(input)
+        if input == stickInput then
+            setStick(Vector2.new(input.Position.X, input.Position.Y))
+        elseif input == lookInput then
+            touchState.look = touchState.look + Vector2.new(input.Delta.X, input.Delta.Y)
+        end
+    end))
+    bind(UserInputService.InputEnded:Connect(function(input)
+        if input == stickInput then
+            resetStick()
+        elseif input == lookInput then
+            lookInput = nil
+        end
+        local h = holds[input]
+        if h then
+            touchState[h[1]] = false
+            h[2].BackgroundTransparency = 0.3
+            holds[input] = nil
+        end
+    end))
+
+    local function tbtn(text, size, anchor, pos, filled)
+        local b = mk("TextButton", {
+            AnchorPoint = anchor, Position = pos, Size = UDim2.fromOffset(size, size),
+            BackgroundColor3 = filled and T.white or T.panel, BackgroundTransparency = filled and 0.1 or 0.3,
+            Font = Enum.Font.GothamBold, Text = text, TextColor3 = filled and T.black or T.white,
+            TextSize = size >= 60 and 13 or (size >= 44 and 10 or 9),
+            AutoButtonColor = false, BorderSizePixel = 0, ZIndex = 5,
+        }, tgui)
+        corner(size / 2, b)
+        addStroke(T.white, 1, 0.55, b)
+        return b
+    end
+    local function holdBtn(b, flag)
+        b.InputBegan:Connect(function(input)
+            local t = input.UserInputType
+            if t == Enum.UserInputType.Touch or t == Enum.UserInputType.MouseButton1 then
+                touchState[flag] = true
+                holds[input] = { flag, b }
+                b.BackgroundTransparency = 0
+            end
+        end)
+    end
+
+    local boomB  = tbtn("BOOM",   62, Vector2.new(1, 1),   UDim2.new(1, -16, 1, -20),  true)
+    local upB    = tbtn("UP",     44, Vector2.new(0.5, 1), UDim2.new(1, -47, 1, -92),  false)
+    local downB  = tbtn("DOWN",   44, Vector2.new(0.5, 1), UDim2.new(1, -47, 1, -144), false)
+    local boostB = tbtn("BOOST",  44, Vector2.new(0.5, 1), UDim2.new(1, -112, 1, -22), false)
+    local camB   = tbtn("CAM",    40, Vector2.new(1, 0),   UDim2.new(1, -66, 0, 60),   false)
+    local recB   = tbtn("RECALL", 40, Vector2.new(1, 0),   UDim2.new(1, -18, 0, 60),   false)
+
+    holdBtn(upB, "up")
+    holdBtn(downB, "down")
+    boostB.Activated:Connect(function()
+        touchState.boost = not touchState.boost
+        boostB.BackgroundColor3 = touchState.boost and T.white or T.panel
+        boostB.TextColor3 = touchState.boost and T.black or T.white
+    end)
+    camB.Activated:Connect(function() firstPerson = not firstPerson end)
+    recB.Activated:Connect(function() if flying then endFlight(false) end end)
+    boomB.Activated:Connect(function()
+        if flying and os.clock() - flightStart > CONFIG.DRONE_MIN then endFlight(true) end
+    end)
+
+    setTouchVisible = function(v)
+        tgui.Visible = v
+        lookInput = nil
+        resetStick()
+        touchState.look = Vector2.zero
+        touchState.up, touchState.down, touchState.boost = false, false, false
+        boostB.BackgroundColor3 = T.panel
+        boostB.TextColor3 = T.white
+        upB.BackgroundTransparency = 0.3
+        downB.BackgroundTransparency = 0.3
+    end
+end
+
+local function launchDrone()
+    if flying then return end
+    local char = getChar()
+    local hum, r = getHum(), getRoot()
+    if not (hum and r and hum.Health > 0) then return end
+    local isFpv = (droneType == "fpv")
+
+    local okModel, model = pcall(makeDroneModel, droneType)
+    if not okModel or not model or not anyPart(model) then
+        setStatus("модель не загрузилась")
+        warn("[ШАХЕД HUB] модель дрона не построилась, запуск отменён")
+        return
+    end
+
+    recBuf = {}
+    recPlayers = {}
+
+    flying = true
+    savedWS, savedJP = hum.WalkSpeed, hum.JumpPower
+    hum.WalkSpeed, hum.JumpPower = 0, 0
+    pcall(function() controls:Disable() end)
+    if CONFIG.HIDE_CHAR then hideChar(true) end
+    if CONFIG.FREEZE_CHAR then
+        r.Anchored = true
+    end
+    if toggleWindow then toggleWindow(false) end
+    if not IS_MOBILE then
+        UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
+    end
+
+    droneModel = model
+    droneModel.Parent = workspace
+    droneParts = {}
+    fpApplied = false
+    for _, dp in ipairs(droneModel:GetDescendants()) do
+        if dp:IsA("BasePart") then droneParts[#droneParts + 1] = dp end
+    end
+
+    --═══ НАСТРОЙКА УПРАВЛЕНИЯ ═══
+    local spd, boost, vert, lerpK, camOff, backSpd, strafe, yawK, rollK, sens, pMin, pMax, engineBase0, engineVol
+    if isFpv then
+        spd = 95
+        boost = 160
+        vert = 42
+        lerpK = 6.5
+        camOff = CFrame.new(0, CONFIG.CAM_FPV_Y, CONFIG.CAM_FPV_D)
+        backSpd = 35
+        strafe = CONFIG.STRAFE
+        yawK = 2.8
+        rollK = 0.28
+        sens = 0.0045
+        pMin = -1.5
+        pMax = 1.45
+        engineBase0 = 1
+        engineVol = 0.95
+    else
+        spd = 60
+        boost = 110
+        vert = 28
+        lerpK = 4
+        camOff = CFrame.new(0, CONFIG.CAM_SH_Y, CONFIG.CAM_SH_D)
+        backSpd = 0
+        strafe = 0
+        yawK = 1.8
+        rollK = 0.3
+        sens = 0.0035
+        pMin = -1.45
+        pMax = 1.3
+        engineBase0 = 1
+        engineVol = 1.1
+    end
+
+    local fpCamOff = isFpv and CFrame.new(0, 0.15, -2.2) or CFrame.new(0, 0.3, -5.5)
+    local cam0 = workspace.CurrentCamera
+    local look = cam0 and cam0.CFrame.LookVector or Vector3.new(0, 0, -1)
+    yaw = math.atan2(-look.X, -look.Z)
+    pitch, roll, vel, spin = 0, 0, Vector3.zero, 0
+    firstPerson = false
+    flightStart = os.clock()
+    dronePos = r.Position + Vector3.new(0, isFpv and 2 or 3, 0)
+
+    local pivot0 = CFrame.new(dronePos) * CFrame.fromEulerAnglesYXZ(0, yaw, 0)
+    droneModel:PivotTo(pivot0)
+
+    if cam0 then
+        cam0.CameraType = Enum.CameraType.Scriptable
+        local eye = (pivot0 * camOff).Position
+        cam0.CFrame = CFrame.lookAt(eye, eye + pivot0.LookVector)
+    end
+
+    -- ШАХЕД: v5.2 логика • FPV: эффекты вращения (лопасти не трогаем)
+    propLocals = {}
+    fpvFX = {}
+    if isFpv then
+        fpvFX = createFpvSpinFX(droneModel, collectFpvHubs(droneModel, pivot0))
+        for _, g in ipairs(fpvFX) do
+            for _, mem in ipairs(g.parts) do
+                droneParts[#droneParts + 1] = mem.p
+            end
+        end
+    else
+        propLocals = collectPropLocals(droneModel, false, pivot0)
+    end
+
+    local engId = pickSound(isFpv and "engine_fpv" or "engine_shahed")
+    if engId then
+        engineSound = makeSound(engId, SoundService, true, engineVol)
+        engineBase = engineBase0
+    else
+        engineSound = makeSound(SND_ENGINE, SoundService, true, engineVol)
+        engineBase = isFpv and 1.2 or 0.9
+    end
+    if engineSound then
+        engineSound.PlaybackSpeed = engineBase
+        engineSound:Play()
+    end
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { droneModel, char }
+
+    setStatus("DRONE ACTIVE")
+    setButtons(false, true, true)
+    if hintLbl then hintLbl.Visible = not IS_MOBILE end
+    if osd then osd.Visible = true end
+    setTouchVisible(true)
+    local lastYaw = yaw
+
+    RunService:BindToRenderStep(CAM_BIND, Enum.RenderPriority.Camera.Value + 1, function(dt)
+        local hum2 = getHum()
+        if not (droneModel and hum2 and hum2.Health > 0) then endFlight(false) return end
+
+        local cam = workspace.CurrentCamera
+        if not cam then return end
+        if cam.CameraType ~= Enum.CameraType.Scriptable then
+            cam.CameraType = Enum.CameraType.Scriptable
+        end
+        if not IS_MOBILE and UserInputService.MouseBehavior ~= Enum.MouseBehavior.LockCenter then
+            UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
+        end
+
+        local md = UserInputService:GetMouseDelta()
+        if IS_MOBILE then
+            md = md + touchState.look * 1.3
+            touchState.look = Vector2.zero
+        end
+        yaw -= md.X * sens
+        pitch = math.clamp(pitch - md.Y * sens, pMin, pMax)
+
+        local rightV = Vector3.new(math.cos(yaw), 0, -math.sin(yaw))
+
+        if not isFpv then
+            if UserInputService:IsKeyDown(Enum.KeyCode.A) then yaw += yawK * dt end
+            if UserInputService:IsKeyDown(Enum.KeyCode.D) then yaw -= yawK * dt end
+            if IS_MOBILE then yaw -= touchState.mv.X * yawK * dt end
+        end
+
+        local lookV = CFrame.fromEulerAnglesYXZ(pitch, yaw, 0).LookVector
+        local flat = Vector3.new(lookV.X, 0, lookV.Z)
+        if flat.Magnitude > 0.001 then flat = flat.Unit else flat = Vector3.zero end
+
+        local ms = touchState.mv
+        local boosting = UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) or touchState.boost
+        local fwdAxis, backAxis, strafeAxis, upAxis = 0, 0, 0, 0
+        if UserInputService:IsKeyDown(Enum.KeyCode.W) then fwdAxis = 1 end
+        if UserInputService:IsKeyDown(Enum.KeyCode.S) then backAxis = 1 end
+        if UserInputService:IsKeyDown(Enum.KeyCode.D) then strafeAxis += 1 end
+        if UserInputService:IsKeyDown(Enum.KeyCode.A) then strafeAxis -= 1 end
+        if UserInputService:IsKeyDown(Enum.KeyCode.Space) then upAxis += 1 end
+        if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then upAxis -= 1 end
+        if IS_MOBILE then
+            fwdAxis = math.max(fwdAxis, math.clamp(ms.Y * 1.25, 0, 1))
+            backAxis = math.max(backAxis, math.clamp(-ms.Y * 1.25, 0, 1))
+            strafeAxis = math.clamp(strafeAxis + ms.X, -1, 1)
+            if touchState.up then upAxis += 1 end
+            if touchState.down then upAxis -= 1 end
+        end
+        local tv = Vector3.zero
+        if fwdAxis > 0 then tv = tv + lookV * ((boosting and boost or spd) * fwdAxis) end
+        -- НАЗАД = по обратному взгляду: камера вниз + S = назад-вверх
+        if backSpd > 0 and backAxis > 0 then tv = tv - lookV * (backSpd * backAxis) end
+        if strafe > 0 and strafeAxis ~= 0 then tv = tv + rightV * (strafe * strafeAxis) end
+        if upAxis ~= 0 then tv = tv + Vector3.new(0, vert * upAxis, 0) end
+        vel = vel:Lerp(tv, math.clamp(dt * lerpK, 0, 1))
+        local move = vel * dt
+        if move.Magnitude > 0 then
+            local hit = workspace:Spherecast(dronePos, 1.2, move, params)
+            if hit then
+                local dd = move:Dot(hit.Normal)
+                if dd < 0 then move = move - hit.Normal * dd end
+            end
+            dronePos = dronePos + move
+        end
+
+        for _, o in ipairs(Players:GetPlayers()) do
+            if o ~= player and o.Character then
+                local hr = o.Character:FindFirstChild("HumanoidRootPart")
+                local oh = o.Character:FindFirstChildOfClass("Humanoid")
+                if hr and oh and oh.Health > 0 and (hr.Position - dronePos).Magnitude < CONFIG.COLLIDE_DIST then
+                    endFlight(true)
+                    return
+                end
+            end
+        end
+
+        local yawRate = (yaw - lastYaw) / math.max(dt, 1/240)
+        lastYaw = yaw
+        local rollTarget
+        if isFpv then
+            rollTarget = math.clamp(-vel:Dot(rightV) * rollK * 0.02, -0.3, 0.3)
+        else
+            rollTarget = math.clamp(yawRate * rollK, -0.5, 0.5)
+        end
+        roll = roll + (rollTarget - roll) * math.clamp(dt * 7, 0, 1)
+
+        local pivot = CFrame.new(dronePos) * CFrame.fromEulerAnglesYXZ(pitch, yaw, roll)
+        droneModel:PivotTo(pivot)
+
+        -- винты: FPV — эффекты (лопасти статичны), ШАХЕД — v5.2
+        if isFpv then
+            spin = spin + dt * 22
+            updateFpvFX(fpvFX, pivot, spin)
+        else
+            spin = spin + dt * 40
+            for _, pr in ipairs(propLocals) do
+                if pr.p.Parent then
+                    local sp
+                    if pr.axisRel then
+                        sp = pr.rel.Rotation * CFrame.fromAxisAngle(pr.axisRel, spin)
+                    elseif pr.ax == "y" then
+                        sp = pr.rel.Rotation * CFrame.Angles(0, spin, 0)
+                    else
+                        sp = pr.rel.Rotation * CFrame.Angles(0, 0, spin)
+                    end
+                    pr.p.CFrame = pivot * CFrame.new(pr.rel.Position) * sp
+                end
+            end
+        end
+
+        if firstPerson ~= fpApplied then
+            fpApplied = firstPerson
+            for _, dp in ipairs(droneParts) do
+                if dp.Parent then dp.LocalTransparencyModifier = fpApplied and 1 or 0 end
+            end
+        end
+        local camT
+        if firstPerson then
+            camT = pivot * fpCamOff
+        else
+            local eye = (pivot * camOff).Position
+            camT = CFrame.lookAt(eye, eye + pivot.LookVector)
+        end
+        cam.CFrame = camT
+
+        local nowT = os.clock()
+        recBuf[#recBuf + 1] = { t = nowT, cf = pivot }
+        while #recBuf > 2 and nowT - recBuf[1].t > CONFIG.REC_LEN do table.remove(recBuf, 1) end
+        for _, o in ipairs(Players:GetPlayers()) do
+            if o ~= player and o.Character then
+                local hr = o.Character:FindFirstChild("HumanoidRootPart")
+                if hr and hr.Parent then
+                    local arr = recPlayers[o]
+                    if not arr then arr = {} recPlayers[o] = arr end
+                    arr[#arr + 1] = { t = nowT, cf = hr.CFrame }
+                    while #arr > 2 and nowT - arr[1].t > CONFIG.REC_LEN do table.remove(arr, 1) end
+                end
+            end
+        end
+
+        local bat = math.max(8, 98 - math.floor((os.clock() - flightStart) / 8))
+        osdLBox.Text = string.format("SPD %03d\nFPS %d", math.floor(vel.Magnitude + 0.5), state.fps)
+        osdRBox.Text = string.format("ALT %d\nBAT %d%%", math.floor(dronePos.Y + 0.5), bat)
+        batLbl.Text = string.format("BAT %d%%", bat)
+        recDot.Visible = (os.clock() % 1) < 0.55
+        if engineSound then
+            pcall(function() engineSound.PlaybackSpeed = engineBase + vel.Magnitude / 400 end)
+        end
+    end)
+end
+
+-- ОКНО -----------------------------------------------------------------
+local win, winScale, menuBtn
+local tooltip, tooltipTween
+local menuOpen = false
+local menuTween = nil
+local tooltipToken = 0
+
+local function hideTooltip()
+    tooltipToken += 1
+    if not (tooltip and tooltip.Visible) then return end
+    if tooltipTween then tooltipTween:Cancel() end
+    tooltipTween = tw(tooltip, 0.12, { BackgroundTransparency = 1, TextTransparency = 1 })
+    tooltipTween.Completed:Once(function()
+        tooltip.Visible = false
+    end)
+end
+
+local function showTooltip()
+    if menuOpen or not tooltip then return end
+    tooltipToken += 1
+    local my = tooltipToken
+    if tooltipTween then tooltipTween:Cancel() end
+    tooltip.BackgroundTransparency = 1
+    tooltip.TextTransparency = 1
+    tooltip.Visible = true
+    tooltipTween = tw(tooltip, 0.12, { BackgroundTransparency = 0.05, TextTransparency = 0 })
+    task.delay(1.6, function()
+        if tooltipToken ~= my then return end
+        if tooltip and tooltip.Visible then
+            tooltipTween = tw(tooltip, 0.2, { BackgroundTransparency = 1, TextTransparency = 1 })
+            tooltipTween.Completed:Once(function()
+                tooltip.Visible = false
+            end)
+        end
+    end)
+end
+
+local function setMenuOpen(open)
+    menuOpen = open
+    if open then hideTooltip() end
+    if win then
+        if menuTween then menuTween:Cancel() menuTween = nil end
+        if open then
+            win.Visible = true
+            winScale.Scale = 0.9
+            win.GroupTransparency = 1
+            menuTween = tw(win, 0.22, { GroupTransparency = 0 })
+            tw(winScale, 0.22, { Scale = 1 })
+        else
+            menuTween = tw(win, 0.15, { GroupTransparency = 1 })
+            tw(winScale, 0.15, { Scale = 0.9 })
+            menuTween.Completed:Once(function()
+                if not menuOpen then win.Visible = false end
+            end)
+        end
+    end
+    if menuBtn then
+        menuBtn.Text = open and "ЗАКРЫТЬ" or "МЕНЮ"
+    end
+end
+
+toggleWindow = function(force)
+    setMenuOpen(force == nil and (not menuOpen) or force)
+end
+
+local typeNameLbl, rotLbl
+
+local function buildWindow()
+    win = mk("CanvasGroup", {
+        AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+        Size = IS_MOBILE and UDim2.fromOffset(290, 196) or UDim2.fromOffset(430, 330), BackgroundColor3 = T.bg,
+        BorderSizePixel = 0, Visible = false, Active = true, ClipsDescendants = true,
+    }, root)
+    corner(14, win)
+    addStroke(T.stroke, 1, 0.35, win)
+    winScale = mk("UIScale", {}, win)
+
+    local TB = IS_MOBILE and 34 or 46
+    local tbar = mk("Frame", { Size = UDim2.new(1, 0, 0, TB), BackgroundTransparency = 1, Active = true }, win)
+    local wTitle = mk("TextLabel", {
+        BackgroundTransparency = 1, Position = UDim2.fromOffset(18, 0), Size = UDim2.fromOffset(220, TB),
+        Font = Enum.Font.GothamBlack, Text = "ШАХЕД HUB", TextColor3 = T.white, TextSize = IS_MOBILE and 16 or 21,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, tbar)
+    addShimmer(wTitle, 0.18)
+    local x = mk("TextButton", {
+        AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -12, 0.5, 0),
+        Size = UDim2.fromOffset(28, 28), BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold, Text = "X", TextColor3 = T.dim, TextSize = 14,
+    }, tbar)
+    x.MouseEnter:Connect(function() tw(x, 0.12, { TextColor3 = T.white }) end)
+    x.MouseLeave:Connect(function() tw(x, 0.15, { TextColor3 = T.dim }) end)
+    x.MouseButton1Click:Connect(function() setMenuOpen(false) end)
+
+    local dragging, dStart, dPos = false, nil, nil
+    tbar.InputBegan:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+            dragging, dStart, dPos = true, inp.Position, win.Position
+        end
+    end)
+    bind(UserInputService.InputChanged:Connect(function(inp)
+        if dragging and (inp.UserInputType == Enum.UserInputType.MouseMovement or inp.UserInputType == Enum.UserInputType.Touch) then
+            local d = inp.Position - dStart
+            win.Position = dPos + UDim2.fromOffset(d.X, d.Y)
+        end
+    end))
+    bind(UserInputService.InputEnded:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end))
+
+    local sf = mk("ScrollingFrame", {
+        Position = UDim2.fromOffset(0, TB), Size = UDim2.new(1, 0, 1, -TB),
+        BackgroundTransparency = 1, BorderSizePixel = 0,
+        CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        ScrollBarThickness = 3, ScrollBarImageColor3 = T.faint,
+    }, win)
+    mk("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }, sf)
+    local PAD = IS_MOBILE and 8 or 14
+    mk("UIPadding", { PaddingLeft = UDim.new(0, PAD), PaddingRight = UDim.new(0, PAD), PaddingTop = UDim.new(0, PAD), PaddingBottom = UDim.new(0, PAD) }, sf)
+
+    local n = 0
+    local function ord() n += 1 return n end
+
+    local tyRow = mk("Frame", { Size = UDim2.new(1, 0, 0, IS_MOBILE and 32 or 38), BackgroundColor3 = T.panel, BorderSizePixel = 0, LayoutOrder = ord() }, sf)
+    corner(10, tyRow)
+    addStroke(T.stroke, 1, 0.35, tyRow)
+    local tyShade = mk("Frame", {
+        Position = UDim2.new(0, 4, 0, 4), Size = UDim2.new(0.5, -6, 1, -8),
+        BackgroundColor3 = T.white, BorderSizePixel = 0, ZIndex = 1,
+    }, tyRow)
+    corner(8, tyShade)
+    local lblL = mk("TextLabel", {
+        BackgroundTransparency = 1, Size = UDim2.new(0.5, -6, 1, 0), Position = UDim2.new(0, 4, 0, 0),
+        Font = Enum.Font.GothamBold, Text = "ШАХЕД", TextSize = 13, TextColor3 = T.black, ZIndex = 3,
+    }, tyRow)
+    local lblR = mk("TextLabel", {
+        BackgroundTransparency = 1, Position = UDim2.new(0.5, 2, 0, 0), Size = UDim2.new(0.5, -6, 1, 0),
+        Font = Enum.Font.GothamBold, Text = "FPV", TextSize = 13, TextColor3 = T.text, ZIndex = 3,
+    }, tyRow)
+    local bL = mk("TextButton", { BackgroundTransparency = 1, Size = UDim2.new(0.5, 0, 1, 0), Text = "", ZIndex = 4 }, tyRow)
+    local bR = mk("TextButton", { BackgroundTransparency = 1, Position = UDim2.new(0.5, 0, 0, 0), Size = UDim2.new(0.5, 0, 1, 0), Text = "", ZIndex = 4 }, tyRow)
+    local function renderType()
+        if droneType == "shahed" then
+            tw(tyShade, 0.18, { Position = UDim2.new(0, 4, 0, 4) })
+            lblL.TextColor3 = T.black
+            lblR.TextColor3 = T.text
+            if typeNameLbl then typeNameLbl.Text = "ШАХЕД-1" end
+        else
+            tw(tyShade, 0.18, { Position = UDim2.new(0.5, 2, 0, 4) })
+            lblL.TextColor3 = T.text
+            lblR.TextColor3 = T.black
+            if typeNameLbl then typeNameLbl.Text = "FPV-1" end
+        end
+        if rotLbl then
+            local rt = droneRot[droneType]
+            rotLbl.Text = string.format("%s: X%d Y%d Z%d", droneType == "shahed" and "ШАХЕД" or "FPV", rt.x, rt.y, rt.z)
+        end
+    end
+    bL.MouseButton1Click:Connect(function() if not flying then droneType = "shahed" renderType() end end)
+    bR.MouseButton1Click:Connect(function() if not flying then droneType = "fpv" renderType() end end)
+
+    local card = mk("Frame", { Size = UDim2.new(1, 0, 0, IS_MOBILE and 50 or 58), BackgroundColor3 = T.card, BorderSizePixel = 0, LayoutOrder = ord() }, sf)
+    corner(10, card)
+    addStroke(T.stroke, 1, 0.4, card)
+    mk("TextLabel", { BackgroundTransparency = 1, Position = UDim2.fromOffset(12, 8), Size = UDim2.new(1, -24, 0, 11), Font = Enum.Font.GothamBold, Text = "STATUS", TextColor3 = T.dim, TextSize = 10, TextXAlignment = Enum.TextXAlignment.Left }, card)
+    local stat = mk("TextLabel", { BackgroundTransparency = 1, Position = UDim2.fromOffset(12, 21), Size = UDim2.new(1, -140, 0, 24), Font = Enum.Font.GothamBold, Text = "READY", TextColor3 = T.white, TextSize = 17, TextXAlignment = Enum.TextXAlignment.Left }, card)
+    typeNameLbl = mk("TextLabel", { BackgroundTransparency = 1, AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -12, 0, 12), Size = UDim2.fromOffset(130, 30), Font = Enum.Font.Code, Text = "ШАХЕД-1", TextColor3 = T.faint, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Right }, card)
+
+    local brow = mk("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, IS_MOBILE and 34 or 38), LayoutOrder = ord() }, sf)
+    local bl = mk("TextButton", { Size = UDim2.new(1/3, -3, 1, 0), BackgroundColor3 = T.white, Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = T.black, Text = "LAUNCH", AutoButtonColor = false, BorderSizePixel = 0 }, brow)
+    local br = mk("TextButton", { Position = UDim2.new(1/3, 3, 0, 0), Size = UDim2.new(1/3, -3, 1, 0), BackgroundColor3 = T.card, Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = T.text, Text = "RECALL", AutoButtonColor = false, BorderSizePixel = 0 }, brow)
+    local bd = mk("TextButton", { Position = UDim2.new(2/3, 3, 0, 0), Size = UDim2.new(1/3, -3, 1, 0), BackgroundColor3 = T.card, Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = T.text, Text = "DETONATE", AutoButtonColor = false, BorderSizePixel = 0 }, brow)
+    for _, b in ipairs({ bl, br, bd }) do corner(9, b) end
+    local styles = {
+        [bl] = { on = { bg = T.white, txt = T.black }, off = { bg = T.card, txt = T.faint } },
+        [br] = { on = { bg = T.card, txt = T.text }, off = { bg = T.card, txt = T.faint } },
+        [bd] = { on = { bg = T.card, txt = T.text }, off = { bg = T.card, txt = T.faint } },
+    }
+    local function setB(b, onS)
+        b.Active = onS
+        local s = styles[b][onS and "on" or "off"]
+        b.BackgroundColor3, b.TextColor3 = s.bg, s.txt
+    end
+    droneUI = { status = stat, set = function(l, r2, d) setB(bl, l) setB(br, r2) setB(bd, d) end }
+    setB(bl, true) setB(br, false) setB(bd, false)
+    bl.MouseButton1Click:Connect(function() if bl.Active then launchDrone() end end)
+    br.MouseButton1Click:Connect(function() if br.Active then endFlight(false) end end)
+    bd.MouseButton1Click:Connect(function() if bd.Active then endFlight(true) end end)
+
+    if not IS_MOBILE then
+    local fx = mk("Frame", { Size = UDim2.new(1, 0, 0, 90), BackgroundColor3 = T.bg, BorderSizePixel = 0, ClipsDescendants = true, LayoutOrder = ord() }, sf)
+    corner(10, fx)
+    addStroke(T.stroke, 1, 0.5, fx)
+    local dots = {}
+    for i = 1, 16 do
+        local holder = mk("Frame", { AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.fromOffset(1, 1), BackgroundTransparency = 1, ZIndex = 2 }, fx)
+        local halo = mk("Frame", {
+            AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+            Size = UDim2.fromOffset(10, 10), BackgroundColor3 = T.white,
+            BackgroundTransparency = 0.9, BorderSizePixel = 0,
+        }, holder)
+        corner(8, halo)
+        local core = mk("Frame", {
+            AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+            Size = UDim2.fromOffset(2, 2), BackgroundColor3 = T.white,
+            BackgroundTransparency = 0.15, BorderSizePixel = 0,
+        }, holder)
+        corner(2, core)
+        dots[i] = {
+            h = holder, halo = halo, core = core,
+            cx = math.random(), cy = math.random(),
+            rx = 0.03 + math.random() * 0.06, ry = 0.03 + math.random() * 0.06,
+            sa = 0.1 + math.random() * 0.25, sb = 0.1 + math.random() * 0.25,
+            pa = math.random() * 6.28, pb = math.random() * 6.28,
+            fl = 0.4 + math.random() * 0.9,
+        }
+    end
+    bind(RunService.RenderStepped:Connect(function()
+        if not (win and win.Visible) then return end
+        local t = os.clock()
+        for _, d in ipairs(dots) do
+            local px = d.cx + math.sin(t * d.sa + d.pa) * d.rx
+            local py = d.cy + math.cos(t * d.sb + d.pb) * d.ry
+            d.h.Position = UDim2.new(px, 0, py, 0)
+            local pulse = 0.5 + 0.5 * math.sin(t * d.fl + d.pa)
+            d.halo.BackgroundTransparency = 0.93 - 0.1 * pulse
+            d.halo.Size = UDim2.fromOffset(8 + pulse * 5, 8 + pulse * 5)
+            d.core.BackgroundTransparency = 0.45 - 0.35 * pulse
+        end
+    end))
+
+    end
+
+    renderType()
+end
+
+-- HUD -------------------------------------------------------------------
+local function buildHUD()
+    hudWrap = mk("Frame", {
+        Position = UDim2.fromOffset(12, 44),
+        Size = UDim2.fromOffset(0, 0),
+        BackgroundTransparency = 1, BorderSizePixel = 0,
+    }, root)
+
+    bar = mk("TextButton", {
+        Position = UDim2.fromOffset(0, 0),
+        Size = UDim2.fromOffset(0, IS_MOBILE and 30 or 36),
+        AutomaticSize = Enum.AutomaticSize.X,
+        BackgroundColor3 = T.bg,
+        BackgroundTransparency = 0.05, BorderSizePixel = 0, AutoButtonColor = false, Text = "",
+    }, hudWrap)
+    corner(10, bar)
+    hudStroke = addStroke(T.stroke, 1, 0.25, bar)
+    mk("UIListLayout", {
+        FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 9),
+        VerticalAlignment = Enum.VerticalAlignment.Center, SortOrder = Enum.SortOrder.LayoutOrder,
+    }, bar)
+    mk("UIPadding", { PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12) }, bar)
+
+    local dot = mk("Frame", { Size = UDim2.fromOffset(6, 6), BackgroundColor3 = T.white, BorderSizePixel = 0, LayoutOrder = 1 }, bar)
+    corner(3, dot)
+    local brand = mk("TextLabel", {
+        BackgroundTransparency = 1, Size = UDim2.fromOffset(0, 16), AutomaticSize = Enum.AutomaticSize.X,
+        Font = Enum.Font.GothamBlack, Text = "ШАХЕД HUB", TextColor3 = T.white, TextSize = 13, LayoutOrder = 2,
+    }, bar)
+    addShimmer(brand, 0.3)
+
+    menuBtn = mk("TextLabel", {
+        Size = UDim2.fromOffset(0, 22), AutomaticSize = Enum.AutomaticSize.X,
+        BackgroundColor3 = T.card, Font = Enum.Font.GothamBold, TextSize = 11,
+        TextColor3 = T.text, Text = "МЕНЮ", BorderSizePixel = 0, LayoutOrder = 3,
+    }, bar)
+    corner(6, menuBtn)
+    mk("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8) }, menuBtn)
+
+    local function sepF(o)
+        mk("Frame", { Size = UDim2.fromOffset(1, 14), BackgroundColor3 = T.white, BackgroundTransparency = 0.86, BorderSizePixel = 0, LayoutOrder = o }, bar)
+    end
+    if not IS_MOBILE then
+    sepF(4)
+    local net = mk("Frame", { BackgroundTransparency = 1, Size = UDim2.fromOffset(15, 12), LayoutOrder = 5 }, bar)
+    for i = 1, 4 do
+        hudUI.net[i] = mk("Frame", {
+            BorderSizePixel = 0, BackgroundColor3 = T.white, AnchorPoint = Vector2.new(0, 1),
+            Position = UDim2.fromOffset((i - 1) * 4, 12), Size = UDim2.fromOffset(2, 2 + (i - 1) * 3),
+        }, net)
+    end
+    hudUI.ping = mk("TextLabel", {
+        BackgroundTransparency = 1, Size = UDim2.fromOffset(0, 16), AutomaticSize = Enum.AutomaticSize.X,
+        Font = Enum.Font.Code, Text = "-- ms", TextColor3 = T.hudtxt, TextSize = 12, LayoutOrder = 6,
+    }, bar)
+    sepF(7)
+    hudUI.fps = mk("TextLabel", {
+        BackgroundTransparency = 1, Size = UDim2.fromOffset(0, 16), AutomaticSize = Enum.AutomaticSize.X,
+        Font = Enum.Font.Code, Text = "-- FPS", TextColor3 = T.hudtxt, TextSize = 12, LayoutOrder = 8,
+    }, bar)
+    sepF(9)
+    hudUI.time = mk("TextLabel", {
+        BackgroundTransparency = 1, Size = UDim2.fromOffset(0, 16), AutomaticSize = Enum.AutomaticSize.X,
+        Font = Enum.Font.Code, Text = "--:--", TextColor3 = T.hudtxt, TextSize = 12, LayoutOrder = 10,
+    }, bar)
+    end
+
+    tooltip = mk("TextLabel", {
+        Position = UDim2.fromOffset(0, 42),
+        Size = UDim2.fromOffset(0, 22), AutomaticSize = Enum.AutomaticSize.X,
+        BackgroundColor3 = T.bg, BorderSizePixel = 0,
+        Font = Enum.Font.Code, Text = "  НАЖМИ, ЧТОБЫ ОТКРЫТЬ МЕНЮ  ",
+        TextColor3 = Color3.fromRGB(200, 200, 200), TextSize = 11, Visible = false,
+        ZIndex = 5,
+    }, hudWrap)
+    corner(6, tooltip)
+    addStroke(T.stroke, 1, 0.3, tooltip)
+
+    bar.MouseButton1Click:Connect(function() toggleWindow() end)
+
+    bar.MouseEnter:Connect(function()
+        hudStroke.Color = T.white
+        hudStroke.Transparency = 0
+        hudStroke.Thickness = 2
+        showTooltip()
+    end)
+    bar.MouseLeave:Connect(function()
+        hudStroke.Color = T.stroke
+        hudStroke.Transparency = 0.25
+        hudStroke.Thickness = 1
+        hideTooltip()
+    end)
+
+    local dragging, dStart, dPos = false, nil, nil
+    bar.InputBegan:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+            dragging, dStart, dPos = true, inp.Position, hudWrap.Position
+        end
+    end)
+    bind(UserInputService.InputChanged:Connect(function(inp)
+        if dragging and (inp.UserInputType == Enum.UserInputType.MouseMovement or inp.UserInputType == Enum.UserInputType.Touch) then
+            local d = inp.Position - dStart
+            hudWrap.Position = dPos + UDim2.fromOffset(d.X, d.Y)
+        end
+    end))
+    bind(UserInputService.InputEnded:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end))
+end
+
+-- FPS / PING / TIME -----------------------------------------------------
+do
+    local frames, acc = 0, 0
+    bind(RunService.RenderStepped:Connect(function(dt)
+        frames += 1
+        acc += dt
+        if acc >= 1 then
+            state.fps = math.floor(frames / acc + 0.5)
+            frames, acc = 0, 0
+        end
+    end))
+end
+task.spawn(function()
+    while not bag.unloading do
+        local ok, ms = pcall(function() return math.floor(player:GetNetworkPing() * 1000 + 0.5) end)
+        state.ping = ok and ms or 0
+        if hudUI.ping then
+            hudUI.ping.Text = state.ping .. " ms"
+            hudUI.fps.Text = state.fps .. " FPS"
+            hudUI.time.Text = os.date("%H:%M")
+            local lvl = state.ping < 80 and 4 or state.ping < 150 and 3 or state.ping < 300 and 2 or 1
+            for i, b in ipairs(hudUI.net) do b.BackgroundTransparency = i <= lvl and 0 or 0.72 end
+        end
+        task.wait(0.5)
+    end
+end)
+
+-- ХОТКЕИ -----------------------------------------------------------------
+bind(UserInputService.InputBegan:Connect(function(input, gp)
+    if gp or bag.unloading then return end
+    if input.KeyCode == Enum.KeyCode.M then
+        if not flying then toggleWindow() end
+    elseif flying and input.KeyCode == Enum.KeyCode.X then
+        endFlight(false)
+    elseif flying and input.KeyCode == Enum.KeyCode.V then
+        firstPerson = not firstPerson
+    elseif flying and input.UserInputType == Enum.UserInputType.MouseButton1
+        and os.clock() - flightStart > CONFIG.DRONE_MIN then
+        endFlight(true)
+    end
+end))
+
+bind(player.CharacterAdded:Connect(function()
+    if flying then endFlight(false) end
+end))
+
+-- LOADING SCREEN -----------------------------------------------------------
+task.spawn(function()
+    local gui = mk("ScreenGui", { Name = "ShahedLoader", IgnoreGuiInset = true, DisplayOrder = 1000, ResetOnSpawn = false }, playerGui)
+    local bg = mk("Frame", { Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.fromRGB(8, 8, 8), BorderSizePixel = 0 }, gui)
+    local title = mk("TextLabel", {
+        AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.42),
+        Size = UDim2.fromScale(0.55, 0.12), BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBlack, Text = "ШАХЕД HUB", TextColor3 = T.white, TextScaled = true,
+    }, bg)
+    addShimmer(title, 0.2)
+    local line = mk("Frame", { AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.55), Size = UDim2.fromOffset(320, 2), BackgroundColor3 = Color3.fromRGB(32, 32, 32), BorderSizePixel = 0 }, bg)
+    local fill = mk("Frame", { Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = T.white, BorderSizePixel = 0 }, line)
+    corner(1, line) corner(1, fill)
+    local pct = mk("TextLabel", {
+        AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0.57, 8), Size = UDim2.fromOffset(80, 14),
+        BackgroundTransparency = 1, Font = Enum.Font.Code, Text = "0%", TextColor3 = T.dim, TextSize = 12,
+    }, bg)
+    local status = mk("TextLabel", {
+        AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0.57, 28), Size = UDim2.new(0.7, 0, 0, 16),
+        BackgroundTransparency = 1, Font = Enum.Font.Code, Text = "Инициализация...", TextColor3 = Color3.fromRGB(110, 110, 110), TextSize = 13,
+    }, bg)
+
+    local function progress(p)
+        tw(fill, 0.25, { Size = UDim2.new(p, 0, 1, 0) })
+        pct.Text = math.floor(p * 100 + 0.5) .. "%"
+    end
+
+    local bootError = nil
+    local steps = {
+        { "Инициализация...", function()
+            if not game:IsLoaded() then game.Loaded:Wait() end
+            local c = player.Character or player.CharacterAdded:Wait()
+            c:WaitForChild("HumanoidRootPart", 10)
+        end },
+        { "Загрузка компонентов...", function()
+            buildHUD()
+            buildWindow()
+        end },
+        { "Загрузка моделей...", function()
+            pcall(function() local a = getRawModel("shahed") if a then a:Destroy() end end)
+            pcall(function() local a = getRawModel("fpv") if a then a:Destroy() end end)
+        end },
+        { "Звуки...", function()
+            task.spawn(function()
+                pcall(function() pickSound("engine_shahed") end)
+                pcall(function() pickSound("boom_shahed") end)
+                pcall(function() pickSound("engine_fpv") end)
+                pcall(function() pickSound("boom_fpv") end)
+                pcall(function() pickSound("static") end)
+            end)
+        end },
+    }
+
+    for i, s in ipairs(steps) do
+        status.Text = s[1]
+        local ok, err = pcall(s[2])
+        if not ok then bootError = err break end
+        progress(i / #steps)
+        task.wait(0.08)
+    end
+
+    if bootError then
+        status.Text = "ОШИБКА: " .. tostring(bootError):sub(1, 120)
+        status.TextColor3 = Color3.fromRGB(255, 120, 120)
+        warn("[ШАХЕД HUB] " .. tostring(bootError))
+        return
+    end
+
+    status.Text = "Готово"
+    progress(1)
+    task.wait(0.3)
+
+    local cam = workspace.CurrentCamera
+    if cam then cam.CameraType = Enum.CameraType.Custom end
+    UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+
+    tw(bg, 0.5, { BackgroundTransparency = 1 })
+    tw(title, 0.5, { TextTransparency = 1 })
+    tw(status, 0.5, { TextTransparency = 1 })
+    tw(pct, 0.5, { TextTransparency = 1 })
+    tw(line, 0.5, { BackgroundTransparency = 1 })
+    tw(fill, 0.5, { BackgroundTransparency = 1 })
+    task.wait(0.55)
+    gui:Destroy()
+end)
+                      -- СИСТЕМНОЕ СООБЩЕНИЕ В ЧАТ (как при геймпассе) -----------------------
+task.spawn(function()
+    task.wait(6) -- через 6 секунд после загрузки
+
+    local msg = "Скрипт сделан TG: RickPrimeScripts"
+
+    -- новый чат (TextChatService)
+    local ok = pcall(function()
+        local tcs = game:GetService("TextChatService")
+        local general = tcs:FindFirstChild("TextChannels") and tcs.TextChannels:FindFirstChild("RBXGeneral")
+        if general then
+            general:DisplaySystemMessage("<font color=\"#AAAAAA\">" .. msg .. "</font>")
+        end
+    end)
+
+    -- старый чат (фолбэк)
+    if not ok then
+        pcall(function()
+            game:GetService("StarterGui"):SetCore("ChatMakeSystemMessage", {
+                Text = msg,
+                Color = Color3.fromRGB(170, 170, 170),
+                Font = Enum.Font.SourceSansBold,
+            })
+        end)
+    end
+end)
