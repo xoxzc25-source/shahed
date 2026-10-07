@@ -2474,7 +2474,7 @@ task.spawn(function()
     for _ = 1, 5 do
         local ok = pcall(function()
             StarterGui:SetCore("SendNotification", {
-                Title = "PORTAL GUN v39",
+                Title = "ШАХЕД",
                 Text = "Скрипт от RickPrimeScripts | TG: RickPrimeScripts",
                 Duration = 8,
             })
